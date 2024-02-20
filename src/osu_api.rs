@@ -53,7 +53,7 @@ pub struct HiscoreV2 {
   pub is_perfect_combo: bool,
   pub legacy_perfect: bool,
   pub legacy_score_id: Option<i64>,
-  pub legacy_total_score: i64,
+  pub legacy_total_score: Option<i64>,
   pub max_combo: i64,
   pub passed: bool,
   pub pp: Option<f64>,
@@ -128,8 +128,16 @@ impl HiscoreV2 {
 
     Ok(HiscoreV1 {
       beatmap_id: self.beatmap.id.to_string(),
-      score_id: self.legacy_score_id.unwrap_or(self.id).to_string(),
-      score: self.legacy_total_score.to_string(),
+      score_id: self
+        .legacy_score_id
+        .filter(|id| *id > 0)
+        .unwrap_or(self.id)
+        .to_string(),
+      score: self
+        .legacy_total_score
+        .filter(|score| *score > 0)
+        .unwrap_or(self.total_score)
+        .to_string(),
       maxcombo: self.max_combo.to_string(),
       count50: self.statistics.meh.unwrap_or(0).to_string(),
       count100: self.statistics.ok.unwrap_or(0).to_string(),
@@ -224,25 +232,25 @@ pub struct Beatmap {
 
 #[derive(Deserialize)]
 pub struct Beatmapset {
-  pub artist: String,
-  pub artist_unicode: String,
-  pub covers: Covers,
-  pub creator: String,
-  pub favourite_count: i64,
-  pub hype: Value,
+  // pub artist: String,
+  // pub artist_unicode: String,
+  // pub covers: Covers,
+  // pub creator: String,
+  // pub favourite_count: i64,
+  // pub hype: Value,
   pub id: i64,
-  pub nsfw: bool,
-  pub offset: i64,
-  pub play_count: i64,
-  pub preview_url: String,
-  pub source: String,
-  pub spotlight: bool,
-  pub status: String,
-  pub title: String,
-  pub title_unicode: String,
-  pub track_id: Option<i64>,
-  pub user_id: i64,
-  pub video: bool,
+  // pub nsfw: bool,
+  // pub offset: i64,
+  // pub play_count: i64,
+  // pub preview_url: String,
+  // pub source: String,
+  // pub spotlight: bool,
+  // pub status: String,
+  // pub title: String,
+  // pub title_unicode: String,
+  // pub track_id: Option<i64>,
+  // pub user_id: i64,
+  // pub video: bool,
 }
 
 #[derive(Deserialize)]
