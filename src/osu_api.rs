@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::{fmt::Display, time::Instant};
 
 use crate::{metrics::http_server, oauth::REQWEST_CLIENT, server::APIError};
 
@@ -335,7 +335,9 @@ pub(crate) async fn fetch_user_hiscores(
       message: "Failed to get auth header".to_owned(),
     }
   })?;
+
   http_server::osu_api_requests_total("fetch_user_hiscores").inc();
+  let now = Instant::now();
   let limit = limit.unwrap_or(100);
   let res = REQWEST_CLIENT
     .get(&format!(
@@ -367,6 +369,11 @@ pub(crate) async fn fetch_user_hiscores(
       message: "Failed to read user hiscores response".to_owned(),
     }
   })?;
+
+  let elapsed = now.elapsed();
+  http_server::osu_api_response_time_seconds("fetch_user_hiscores")
+    .observe(elapsed.as_nanos() as u64);
+
   if !status_code.is_success() {
     error!(
       ?status_code,

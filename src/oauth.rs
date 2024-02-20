@@ -1,6 +1,9 @@
 use reqwest::Client;
 use serde::Deserialize;
-use std::{sync::Arc, time::Duration};
+use std::{
+  sync::Arc,
+  time::{Duration, Instant},
+};
 use tokio::sync::{Mutex, OnceCell};
 
 use crate::metrics::http_server;
@@ -94,6 +97,7 @@ pub(crate) async fn get_auth_header() -> Result<String, reqwest::Error> {
   }
 
   info!("Fetching new OAuth token");
+  let now = Instant::now();
   http_server::oauth_refresh_requests_total().inc();
   http_server::osu_api_requests_total("fetch_token").inc();
 
@@ -108,6 +112,7 @@ pub(crate) async fn get_auth_header() -> Result<String, reqwest::Error> {
         token_cache.token = Some(oauth_token.clone());
         token_cache.expiration =
           Some(std::time::Instant::now() + Duration::from_secs(oauth_token.expires_in as u64));
+        http_server::oauth_refresh_response_time_seconds().observe(now.elapsed().as_nanos() as u64);
         return Ok(oauth_token.build_auth_header());
       },
       Err(err) => {
