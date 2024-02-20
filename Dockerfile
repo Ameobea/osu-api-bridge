@@ -21,4 +21,3 @@ COPY --from=builder \
   /usr/local/bin/
 WORKDIR /root
 CMD /usr/local/bin/osu-api-bridge
-
