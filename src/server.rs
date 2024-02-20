@@ -26,6 +26,7 @@ async fn index() -> &'static str {
 struct GetHiscoresParams {
   mode: Ruleset,
   limit: Option<u8>,
+  offset: Option<u8>,
 }
 
 pub struct APIError {
@@ -44,7 +45,8 @@ async fn get_hiscores(
   http_server::requests_total("get_hiscores").inc();
 
   let res = async move {
-    let hiscores_v2 = fetch_user_hiscores(user_id, params.mode, params.limit).await?;
+    let hiscores_v2 =
+      fetch_user_hiscores(user_id, params.mode, params.limit, params.offset).await?;
 
     let hiscores_v1 = hiscores_v2
       .into_iter()

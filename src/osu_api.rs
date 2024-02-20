@@ -81,12 +81,14 @@ fn build_mods_bitmap(mods: &[Mod]) -> u32 {
       "DT" => 1 << 6,
       "RX" => 1 << 7,
       "HT" => 1 << 8,
-      "NC" => 1 << 9,
+      // NC also applies DT's bit
+      "NC" => (1 << 9) | (1 << 6),
       "FL" => 1 << 10,
       "AT" => 1 << 11,
       "SO" => 1 << 12,
       "AP" => 1 << 13,
-      "PF" => 1 << 14,
+      // PF also applies SD's bit
+      "PF" => (1 << 14) | (1 << 5),
       "4K" => 1 << 15,
       "5K" => 1 << 16,
       "6K" => 1 << 17,
@@ -326,6 +328,7 @@ pub(crate) async fn fetch_user_hiscores(
   user_id: u64,
   mode: Ruleset,
   limit: Option<u8>,
+  offset: Option<u8>,
 ) -> Result<GetHiscoresV2Response, APIError> {
   let auth_header = crate::oauth::get_auth_header().await.map_err(|err| {
     error!("Failed to get auth header: {}", err);
@@ -339,9 +342,10 @@ pub(crate) async fn fetch_user_hiscores(
   http_server::osu_api_requests_total("fetch_user_hiscores").inc();
   let now = Instant::now();
   let limit = limit.unwrap_or(100);
+  let offset = offset.unwrap_or(0);
   let res = REQWEST_CLIENT
     .get(&format!(
-      "https://osu.ppy.sh/api/v2/users/{user_id}/scores/best?include_fails=0&legacy_only=false&mode={mode}&limit={limit}",
+      "https://osu.ppy.sh/api/v2/users/{user_id}/scores/best?include_fails=0&legacy_only=false&mode={mode}&limit={limit}&offset={offset}",
     ))
     .header("Content-Type", "application/json")
     .header("x-api-version", "20220705")
