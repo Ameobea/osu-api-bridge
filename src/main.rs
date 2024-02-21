@@ -22,25 +22,13 @@ async fn start() -> BootstrapResult<()> {
 
   // Parse command line arguments. Add additional command line option that allows checking
   // the config without running the server.
-  let cli = Cli::<ServerSettings>::new(&service_info, vec![
-    Arg::new("dry-run")
-      .long("dry-run")
-      .action(ArgAction::SetTrue)
-      .help("Validate or generate config without running the server"),
-    Arg::new("gen-default-config")
-      .long("gen-default-config")
-      .action(ArgAction::SetTrue)
-      .help("Prints the default config to `default-config.yml` and exits"),
-  ])?;
+  let cli = Cli::<ServerSettings>::new(&service_info, vec![Arg::new("dry-run")
+    .long("dry-run")
+    .action(ArgAction::SetTrue)
+    .help("Validate or generate config without running the server")])?;
 
   // Exit if we just want to check the config.
   if cli.arg_matches.get_flag("dry-run") {
-    return Ok(());
-  }
-
-  if cli.arg_matches.get_flag("gen-default-config") {
-    ServerSettings::write_default_settings()?;
-    info!("Default config written to config.yaml");
     return Ok(());
   }
 

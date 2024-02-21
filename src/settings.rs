@@ -1,8 +1,4 @@
-use foundations::{
-  settings::{settings, to_yaml_string},
-  telemetry::settings::TelemetrySettings,
-  BootstrapResult,
-};
+use foundations::{settings::settings, telemetry::settings::TelemetrySettings};
 use serde_default_utils::*;
 
 #[settings]
@@ -17,14 +13,4 @@ pub(crate) struct ServerSettings {
   pub osu_client_id: u32,
   /// Osu! OAuth client secret
   pub osu_client_secret: String,
-}
-
-impl ServerSettings {
-  pub fn write_default_settings() -> BootstrapResult<()> {
-    let settings = Self::default();
-    let yaml_string = to_yaml_string(&settings)?;
-
-    std::fs::write("default-config.yml", yaml_string)?;
-    Ok(())
-  }
 }
