@@ -60,7 +60,7 @@ fn main() -> BootstrapResult<()> {
       record_runtime_metrics_sample();
 
       // record metrics roughly twice a second
-      std::thread::sleep(Duration::from_millis(500));
+      tokio::time::sleep(Duration::from_millis(500)).await;
     }
   });
 
