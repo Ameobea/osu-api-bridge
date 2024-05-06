@@ -1,7 +1,7 @@
 use foundations::telemetry::metrics::{metrics, Counter, HistogramBuilder, TimeHistogram};
 
 #[metrics]
-pub(crate) mod http_server {
+pub mod http_server {
   /// Number of HTTP requests.
   pub fn requests_total(endpoint_name: &'static str) -> Counter;
 

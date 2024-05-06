@@ -1,8 +1,11 @@
 use std::{fmt::Display, time::Instant};
 
-use crate::{metrics::http_server, oauth::REQWEST_CLIENT, server::APIError};
+use crate::{
+  metrics::http_server, mods::build_mods_bitmap, oauth::REQWEST_CLIENT, server::APIError,
+};
 
 use axum::http::StatusCode;
+use reqwest::Method;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
@@ -33,17 +36,12 @@ pub type GetHiscoresV2Response = Vec<HiscoreV2>;
 
 #[derive(Deserialize)]
 pub struct HiscoreV2 {
-  pub ranked: bool,
-  pub preserve: bool,
-  pub maximum_statistics: MaximumStatistics,
   pub mods: Vec<Mod>,
   pub statistics: Statistics,
   pub beatmap_id: i64,
   pub best_id: Value,
   pub id: i64,
   pub rank: String,
-  #[serde(rename = "type")]
-  pub score_type: String,
   pub user_id: i64,
   pub accuracy: f64,
   pub build_id: Option<i64>,
@@ -61,58 +59,46 @@ pub struct HiscoreV2 {
   pub started_at: Option<String>,
   pub total_score: i64,
   pub replay: bool,
-  // pub current_user_attributes: CurrentUserAttributes,
   pub beatmap: Beatmap,
-  // pub beatmapset: Beatmapset,
   pub user: User,
   pub weight: Weight,
 }
 
-fn build_mods_bitmap(mods: &[Mod]) -> u32 {
-  let mut bitmap = 0;
-  for m in mods {
-    bitmap |= match m.acronym.as_str() {
-      "NF" => 1 << 0,
-      "EZ" => 1 << 1,
-      "TD" => 1 << 2,
-      "HD" => 1 << 3,
-      "HR" => 1 << 4,
-      "SD" => 1 << 5,
-      "DT" => 1 << 6,
-      "RX" => 1 << 7,
-      "HT" => 1 << 8,
-      // NC also applies DT's bit
-      "NC" => (1 << 9) | (1 << 6),
-      "FL" => 1 << 10,
-      "AT" => 1 << 11,
-      "SO" => 1 << 12,
-      "AP" => 1 << 13,
-      // PF also applies SD's bit
-      "PF" => (1 << 14) | (1 << 5),
-      "4K" => 1 << 15,
-      "5K" => 1 << 16,
-      "6K" => 1 << 17,
-      "7K" => 1 << 18,
-      "8K" => 1 << 19,
-      "FI" => 1 << 20,
-      "RD" => 1 << 21,
-      "CN" => 1 << 22,
-      "TP" => 1 << 23,
-      "9K" => 1 << 24,
-      "CO" => 1 << 25,
-      "1K" => 1 << 26,
-      "3K" => 1 << 27,
-      "2K" => 1 << 28,
-      "V2" => 1 << 29,
-      "MR" => 1 << 30,
-      "CL" => 0,
-      _ => {
-        error!("Unknown mod: {}", m.acronym);
-        0
-      },
-    };
-  }
-  bitmap
+fn unacronym_mods<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+  D: Deserializer<'de>,
+{
+  let mods: Vec<Mod> = Vec::deserialize(deserializer)?;
+  Ok(mods.iter().map(|m| m.acronym.clone()).collect())
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct UserScoreOnBeatmap {
+  pub ranked: bool,
+  pub preserve: bool,
+  pub processed: bool,
+  #[serde(deserialize_with = "unacronym_mods")]
+  pub mods: Vec<String>,
+  pub statistics: Statistics,
+  pub beatmap_id: i64,
+  pub best_id: Value,
+  pub id: i64,
+  pub rank: String,
+  pub user_id: i64,
+  pub accuracy: f64,
+  pub has_replay: bool,
+  pub is_perfect_combo: bool,
+  pub legacy_perfect: bool,
+  pub legacy_score_id: Value,
+  pub legacy_total_score: i64,
+  pub max_combo: i64,
+  pub passed: bool,
+  pub pp: Option<f64>,
+  pub ruleset_id: i64,
+  pub started_at: Option<String>,
+  pub ended_at: Option<String>,
+  pub total_score: i64,
+  pub replay: bool,
 }
 
 impl HiscoreV2 {
@@ -162,23 +148,12 @@ impl HiscoreV2 {
   }
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
-pub struct MaximumStatistics {
-  pub great: Option<i64>,
-  pub legacy_combo_increase: Option<i64>,
-  pub ignore_hit: Option<i64>,
-  pub large_bonus: Option<i64>,
-  pub small_bonus: Option<i64>,
-  pub large_tick_hit: Option<i64>,
-  pub slider_tail_hit: Option<i64>,
-}
-
-#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
+#[derive(Deserialize)]
 pub struct Mod {
   pub acronym: String,
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Statistics {
   pub ok: Option<i64>,
   pub meh: Option<i64>,
@@ -186,71 +161,20 @@ pub struct Statistics {
   pub great: Option<i64>,
   pub perfect: Option<i64>,
   pub good: Option<i64>,
-  // pub ignore_hit: Option<i64>,
-  // pub ignore_miss: Option<i64>,
   pub large_bonus: Option<i64>,
   pub small_bonus: Option<i64>,
-  // pub large_tick_hit: Option<i64>,
-  // pub slider_tail_hit: Option<i64>,
-}
-
-#[derive(Deserialize)]
-pub struct CurrentUserAttributes {
-  pub pin: Value,
 }
 
 #[derive(Deserialize)]
 pub struct Beatmap {
   pub beatmapset_id: i64,
-  // pub difficulty_rating: f64,
   pub id: i64,
   pub mode: String,
-  // pub status: String,
-  // pub total_length: i64,
-  // pub user_id: i64,
-  // pub version: String,
-  // pub accuracy: f64,
-  // pub ar: f64,
-  // pub bpm: f64,
-  // pub convert: bool,
-  // pub count_circles: i64,
-  // pub count_sliders: i64,
-  // pub count_spinners: i64,
-  // pub cs: f64,
-  // pub deleted_at: Value,
-  // pub drain: f64,
-  // pub hit_length: i64,
-  // pub is_scoreable: bool,
-  // pub last_updated: String,
-  // pub mode_int: i64,
-  // pub passcount: i64,
-  // pub playcount: i64,
-  // pub ranked: i64,
-  // pub url: String,
-  // pub checksum: String,
 }
 
 #[derive(Deserialize)]
 pub struct Beatmapset {
-  // pub artist: String,
-  // pub artist_unicode: String,
-  // pub covers: Covers,
-  // pub creator: String,
-  // pub favourite_count: i64,
-  // pub hype: Value,
   pub id: i64,
-  // pub nsfw: bool,
-  // pub offset: i64,
-  // pub play_count: i64,
-  // pub preview_url: String,
-  // pub source: String,
-  // pub spotlight: bool,
-  // pub status: String,
-  // pub title: String,
-  // pub title_unicode: String,
-  // pub track_id: Option<i64>,
-  // pub user_id: i64,
-  // pub video: bool,
 }
 
 #[derive(Deserialize)]
@@ -271,19 +195,7 @@ pub struct Covers {
 
 #[derive(Deserialize)]
 pub struct User {
-  // pub avatar_url: String,
-  // pub country_code: String,
-  // pub default_group: String,
   pub id: u64,
-  // pub is_active: bool,
-  // pub is_bot: bool,
-  // pub is_deleted: bool,
-  // pub is_online: bool,
-  // pub is_supporter: bool,
-  // pub last_visit: String,
-  // pub pm_friends_only: bool,
-  // pub profile_colour: Value,
-  // pub username: String,
 }
 
 #[derive(Deserialize)]
@@ -328,33 +240,27 @@ impl<'de> Deserialize<'de> for Ruleset {
   }
 }
 
-// curl --request GET \
-//     --get "https://osu.ppy.sh/api/v2/users/493378/scores/best?include_fails=0&legacy_only=false&mode=osu&limit=51&offset=5" \
-//     --header "Content-Type: application/json" --header "x-api-version: 20220705" \
-//     --header "Accept: application/json" --header "Authorization: Bearer <token>"
-pub(crate) async fn fetch_user_hiscores(
-  user_id: u64,
-  mode: Ruleset,
-  limit: Option<u8>,
-  offset: Option<u8>,
-) -> Result<GetHiscoresV2Response, APIError> {
-  let auth_header = crate::oauth::get_auth_header().await.map_err(|err| {
+async fn get_auth_header() -> Result<String, APIError> {
+  crate::oauth::get_auth_header().await.map_err(|err| {
     error!("Failed to get auth header: {}", err);
     http_server::osu_api_requests_failed_total("fetch_user_hiscores", 0).inc();
     APIError {
       status: StatusCode::INTERNAL_SERVER_ERROR,
       message: "Failed to get auth header".to_owned(),
     }
-  })?;
+  })
+}
 
-  http_server::osu_api_requests_total("fetch_user_hiscores").inc();
+async fn make_osu_api_request(
+  url: &str,
+  endpoint_name: &'static str,
+  method: Method,
+) -> Result<String, APIError> {
+  let auth_header = get_auth_header().await?;
+
   let now = Instant::now();
-  let limit = limit.unwrap_or(100);
-  let offset = offset.unwrap_or(0);
   let res = REQWEST_CLIENT
-    .get(&format!(
-      "https://osu.ppy.sh/api/v2/users/{user_id}/scores/best?include_fails=0&legacy_only=false&mode={mode}&limit={limit}&offset={offset}",
-    ))
+    .request(method, url)
     .header("Content-Type", "application/json")
     .header("x-api-version", "20220705")
     .header("Accept", "application/json")
@@ -362,55 +268,107 @@ pub(crate) async fn fetch_user_hiscores(
     .send()
     .await
     .map_err(|err| {
-        error!("Failed to fetch user hiscores: {}", err);
-        http_server::osu_api_requests_failed_total("fetch_user_hiscores", err.status().map(|s| s.as_u16()).unwrap_or(0)).inc();
-        APIError {
-          status: StatusCode::INTERNAL_SERVER_ERROR,
-          message: "Failed to fetch user hiscores".to_owned(),
-        }
+      error!("Error making osu! API request for {endpoint_name} to {url}: {err}");
+      http_server::osu_api_requests_failed_total(endpoint_name, 0).inc();
+      APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: "Failed to make osu! API request".to_owned(),
+      }
     })?;
+  let elapsed = now.elapsed();
+  http_server::osu_api_response_time_seconds(endpoint_name).observe(elapsed.as_nanos() as u64);
+
   let status_code = res.status();
-  let res_text = res.text().await.map_err(|err| {
+  res.text().await.map_err(|err| {
     error!(
       ?status_code,
-      "Failed to read user hiscores response: {}", err
+      ?endpoint_name,
+      "Failed to read osu! API response: {err}"
     );
-    http_server::osu_api_requests_failed_total("fetch_user_hiscores", status_code.as_u16()).inc();
+    http_server::osu_api_requests_failed_total(endpoint_name, status_code.as_u16()).inc();
     APIError {
       status: StatusCode::INTERNAL_SERVER_ERROR,
-      message: "Failed to read user hiscores response".to_owned(),
+      message: "Failed to response from osu! API".to_owned(),
     }
-  })?;
+  })
+}
 
-  let elapsed = now.elapsed();
-  http_server::osu_api_response_time_seconds("fetch_user_hiscores")
-    .observe(elapsed.as_nanos() as u64);
+// curl --request GET \
+//     --get "https://osu.ppy.sh/api/v2/users/493378/scores/best?include_fails=0&legacy_only=false&mode=osu&limit=51&offset=5" \
+//     --header "Content-Type: application/json" --header "x-api-version: 20220705" \
+//     --header "Accept: application/json" --header "Authorization: Bearer <token>"
+pub async fn fetch_user_hiscores(
+  user_id: u64,
+  mode: Ruleset,
+  limit: Option<u8>,
+  offset: Option<u8>,
+) -> Result<GetHiscoresV2Response, APIError> {
+  http_server::osu_api_requests_total("fetch_user_hiscores").inc();
 
-  if !status_code.is_success() {
-    error!(
-      ?status_code,
-      "Failed to fetch user hiscores; status: {status_code}; res: {res_text}"
-    );
-    http_server::osu_api_requests_failed_total("fetch_user_hiscores", status_code.as_u16()).inc();
-    return Err(APIError {
-      status: axum::http::StatusCode::from_u16(status_code.as_u16())
-        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-      message: "Failed to fetch user hiscores".to_owned(),
-    });
-  }
+  let limit = limit.unwrap_or(100);
+  let offset = offset.unwrap_or(0);
+
+  let proxy_url = format!(
+    "https://osu.ppy.sh/api/v2/users/{user_id}/scores/best?include_fails=0&legacy_only=false&mode={mode}&limit={limit}&offset={offset}",
+  );
+  let res_text = make_osu_api_request(&proxy_url, "fetch_user_hiscores", Method::GET).await?;
 
   let deserializer = &mut serde_json::Deserializer::from_str(&res_text);
   match serde_path_to_error::deserialize(deserializer) {
     Ok(hiscores) => Ok(hiscores),
     Err(err) => {
-      error!(
-        ?status_code,
-        "Failed to parse user hiscores response; res: {res_text}; err: {err}"
-      );
-      http_server::osu_api_requests_failed_total("fetch_user_hiscores", status_code.as_u16()).inc();
+      error!("Failed to parse user hiscores response; res: {res_text}; err: {err}");
+      http_server::osu_api_requests_failed_total("fetch_user_hiscores", 200).inc();
       Err(APIError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         message: "Failed to parse user hiscores response".to_owned(),
+      })
+    },
+  }
+}
+
+#[derive(Deserialize)]
+struct FetchAllUserScoresForBeatmapRes {
+  scores: Vec<UserScoreOnBeatmap>,
+}
+
+pub async fn fetch_all_user_scores_for_beatmap(
+  user_id: u64,
+  beatmap_id: u64,
+  mode: Ruleset,
+) -> Result<Vec<UserScoreOnBeatmap>, APIError> {
+  let endpoint_name = "fetch_all_user_scores_for_beatmap";
+  let proxy_url = format!("https://osu.ppy.sh/api/v2/beatmaps/{beatmap_id}/scores/users/{user_id}/all?legacy_only=0&mode={mode}");
+  let res_text = make_osu_api_request(&proxy_url, endpoint_name, Method::GET).await?;
+
+  let deserializer = &mut serde_json::Deserializer::from_str(&res_text);
+  match serde_path_to_error::deserialize::<_, FetchAllUserScoresForBeatmapRes>(deserializer) {
+    Ok(res) => Ok(res.scores),
+    Err(err) => {
+      error!("Failed to parse user score response; res: {res_text}; err: {err}");
+      http_server::osu_api_requests_failed_total(endpoint_name, 200).inc();
+      Err(APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: "Failed to parse user score response".to_owned(),
+      })
+    },
+  }
+}
+
+pub async fn fetch_user_id(username: &str, mode: Ruleset) -> Result<u64, APIError> {
+  let endpoint_name = "get_user_id";
+  let proxy_url = format!("https://osu.ppy.sh/api/v2/users/{username}/{mode}?key=username");
+  let res_text = make_osu_api_request(&proxy_url, endpoint_name, Method::GET).await?;
+
+  let deserializer = &mut serde_json::Deserializer::from_str(&res_text);
+  match serde_path_to_error::deserialize::<_, User>(deserializer) {
+    Ok(user) => Ok(user.id),
+    Err(err) => {
+      error!("Failed to parse user response; res: {res_text}; err: {err}");
+      http_server::osu_api_requests_failed_total(endpoint_name, 200).inc();
+      Err(APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: "Failed to parse user response".to_owned(),
       })
     },
   }

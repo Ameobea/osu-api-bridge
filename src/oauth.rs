@@ -73,20 +73,20 @@ struct ClientInfo {
 lazy_static::lazy_static! {
   static ref TOKEN_CACHE: Arc<Mutex<TokenCache>> = Arc::new(Mutex::new(TokenCache::new()));
 
-  pub(crate) static ref REQWEST_CLIENT: Client = Client::new();
+  pub static ref REQWEST_CLIENT: Client = Client::new();
 
   static ref CLIENT_INFO: OnceCell<ClientInfo> = OnceCell::new();
 }
 
 /// This must be called before any requests are made
-pub(crate) fn set_client_info(client_id: u32, client_secret: String) {
+pub fn set_client_info(client_id: u32, client_secret: String) {
   let _ = CLIENT_INFO.set(ClientInfo {
     client_id,
     client_secret,
   });
 }
 
-pub(crate) async fn get_auth_header() -> Result<String, reqwest::Error> {
+pub async fn get_auth_header() -> Result<String, reqwest::Error> {
   let cache_lock = TOKEN_CACHE.clone();
   let mut token_cache = cache_lock.lock().await;
 

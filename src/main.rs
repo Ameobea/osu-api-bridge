@@ -12,6 +12,7 @@ use server::start_server;
 use settings::ServerSettings;
 
 mod metrics;
+mod mods;
 mod oauth;
 mod osu_api;
 mod server;

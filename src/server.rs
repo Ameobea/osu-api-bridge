@@ -4,15 +4,19 @@ use axum::{
   response::{IntoResponse, Response},
   Json, Router,
 };
+use float_ord::FloatOrd;
 use foundations::BootstrapResult;
 use serde::Deserialize;
-use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse};
+use tower_http::{
+  cors,
+  trace::{DefaultMakeSpan, DefaultOnResponse},
+};
 use tracing::Level;
 
 use crate::{
   metrics::http_server,
   oauth::set_client_info,
-  osu_api::{fetch_user_hiscores, HiscoreV1, Ruleset},
+  osu_api::{fetch_user_hiscores, HiscoreV1, Ruleset, UserScoreOnBeatmap},
   settings::ServerSettings,
 };
 
@@ -71,12 +75,136 @@ async fn get_hiscores(
   }
 }
 
+#[derive(Deserialize)]
+struct ModeQueryParam {
+  mode: Ruleset,
+}
+
+async fn get_user_scores_for_beatmap(
+  Path((user_id, beatmap_id)): Path<(u64, u64)>,
+  Query(params): Query<ModeQueryParam>,
+) -> Result<Json<Vec<UserScoreOnBeatmap>>, APIError> {
+  let endpoint_name = "get_user_scores_for_beatmap";
+  http_server::requests_total(endpoint_name).inc();
+
+  match crate::osu_api::fetch_all_user_scores_for_beatmap(user_id, beatmap_id, params.mode).await {
+    Ok(hiscores) => {
+      http_server::requests_success_total(endpoint_name).inc();
+      Ok(Json(hiscores))
+    },
+    Err(err) => {
+      http_server::requests_failed_total(endpoint_name).inc();
+      Err(err)
+    },
+  }
+}
+
+#[derive(Deserialize)]
+struct GetBestScoreParams {
+  mode: Ruleset,
+  // Like "HDDT", "FL", "", etc.
+  mods: Option<String>,
+}
+
+async fn get_user_best_score_for_beatmap(
+  Path((user_id, beatmap_id)): Path<(u64, u64)>,
+  Query(GetBestScoreParams { mode, mods }): Query<GetBestScoreParams>,
+) -> Result<Json<Option<UserScoreOnBeatmap>>, APIError> {
+  let endpoint_name = "get_user_best_score_for_beatmap";
+  http_server::requests_total(endpoint_name).inc();
+
+  let mut scores =
+    match crate::osu_api::fetch_all_user_scores_for_beatmap(user_id, beatmap_id, mode).await {
+      Ok(hiscores) => {
+        http_server::requests_success_total(endpoint_name).inc();
+        hiscores
+      },
+      Err(err) => {
+        http_server::requests_failed_total(endpoint_name).inc();
+        return Err(err);
+      },
+    };
+
+  // split every two characters
+  let required_mods: Vec<String> = match mods {
+    Some(mods) => mods
+      .to_uppercase()
+      .as_str()
+      .chars()
+      .collect::<Vec<char>>()
+      .chunks(2)
+      .map(|c| c.iter().collect())
+      .collect(),
+    None => vec![],
+  };
+
+  fn compare_mod(mod_a: &str, mod_b: &str) -> bool {
+    if mod_a == mod_b {
+      return true;
+    }
+    let mod_a_is_dt = mod_a == "DT" || mod_a == "NC";
+    let mod_b_is_dt = mod_b == "DT" || mod_b == "NC";
+    if mod_a_is_dt && mod_b_is_dt {
+      return true;
+    }
+
+    false
+  }
+
+  scores.retain(|score| {
+    score.passed
+      && required_mods.iter().all(|required_mod| {
+        score
+          .mods
+          .iter()
+          .any(|score_mod| compare_mod(required_mod, score_mod))
+      })
+  });
+  let top_score = scores
+    .into_iter()
+    .max_by_key(|score| FloatOrd(score.pp.unwrap_or(-1.)));
+  Ok(Json(top_score))
+}
+
+async fn get_user_id(
+  Path(username): Path<String>,
+  Query(params): Query<ModeQueryParam>,
+) -> Result<Json<u64>, APIError> {
+  let endpoint_name = "get_user_id";
+  http_server::requests_total(endpoint_name).inc();
+  match crate::osu_api::fetch_user_id(&username, params.mode).await {
+    Ok(user_id) => {
+      http_server::requests_success_total(endpoint_name).inc();
+      Ok(Json(user_id))
+    },
+    Err(err) => {
+      http_server::requests_failed_total(endpoint_name).inc();
+      Err(err)
+    },
+  }
+}
+
 pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
   set_client_info(settings.osu_client_id, settings.osu_client_secret.clone());
 
   let router = Router::new()
     .route("/", axum::routing::get(index))
     .route("/users/:user_id/hiscores", axum::routing::get(get_hiscores))
+    .route(
+      "/users/:user_id/beatmaps/:beatmap_id/scores",
+      axum::routing::get(get_user_scores_for_beatmap),
+    )
+    .route(
+      "/users/:user_id/beatmaps/:beatmap_id/best",
+      axum::routing::get(get_user_best_score_for_beatmap),
+    )
+    .route("/users/:username/id", axum::routing::get(get_user_id))
+    .layer(
+      tower_http::cors::CorsLayer::new()
+        .allow_origin(cors::Any)
+        .allow_headers(cors::Any)
+        .allow_methods(cors::Any),
+    )
     .layer(
       tower_http::trace::TraceLayer::new_for_http()
         .make_span_with(DefaultMakeSpan::new().level(Level::INFO))

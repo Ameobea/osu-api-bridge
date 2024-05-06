@@ -2,9 +2,9 @@ use foundations::{settings::settings, telemetry::settings::TelemetrySettings};
 use serde_default_utils::*;
 
 #[settings]
-pub(crate) struct ServerSettings {
+pub struct ServerSettings {
   /// Telemetry settings.
-  pub(crate) telemetry: TelemetrySettings,
+  pub telemetry: TelemetrySettings,
 
   /// Port that the HTTP server will listen on.
   #[serde(default = "default_u16::<4510>")]
