@@ -1,6 +1,12 @@
 use foundations::{settings::settings, telemetry::settings::TelemetrySettings};
 use serde_default_utils::*;
 
+#[cfg(feature = "sql")]
+#[settings]
+pub struct SqlSettings {
+  pub db_url: String,
+}
+
 #[settings]
 pub struct ServerSettings {
   /// Telemetry settings.
@@ -13,4 +19,6 @@ pub struct ServerSettings {
   pub osu_client_id: u32,
   /// Osu! OAuth client secret
   pub osu_client_secret: String,
+  #[cfg(feature = "sql")]
+  pub sql: SqlSettings,
 }
