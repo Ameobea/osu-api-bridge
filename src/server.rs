@@ -186,11 +186,10 @@ async fn get_user_id(
 
 #[cfg(feature = "simulate_play")]
 mod simulate_play {
-  use axum::extract;
   use serde::Serialize;
   use std::{io::Read, str::FromStr};
 
-  use rosu_pp::{Beatmap, Performance};
+  use rosu_pp::{any::DifficultyAttributes, Beatmap, Performance};
   use rosu_v2::model::GameMods;
   use tokio::sync::OnceCell;
 
@@ -240,8 +239,23 @@ mod simulate_play {
     })
   }
 
-  async fn simulate_play(
+  fn compute_diff_attrs(
     beatmap: &Beatmap,
+    mod_string: &str,
+  ) -> Result<DifficultyAttributes, APIError> {
+    let mods = GameMods::from_str(mod_string).map_err(|err| APIError {
+      status: StatusCode::BAD_REQUEST,
+      message: format!("Invalid mods: {err}"),
+    })?;
+    Ok(
+      rosu_pp::Difficulty::new()
+        .mods(mods.bits())
+        .calculate(&beatmap),
+    )
+  }
+
+  async fn simulate_play(
+    diff_attrs: DifficultyAttributes,
     params: &SimulatePlayQueryParams,
   ) -> Result<f64, APIError> {
     let mods =
@@ -249,10 +263,6 @@ mod simulate_play {
         status: StatusCode::BAD_REQUEST,
         message: format!("Invalid mods: {err}"),
       })?;
-
-    let diff_attrs = rosu_pp::Difficulty::new()
-    .mods(mods.bits()) // HDHR
-    .calculate(&beatmap);
 
     let mut perf = Performance::new(diff_attrs).mods(mods.bits());
     if let Some(acc) = params.acc {
@@ -297,9 +307,23 @@ mod simulate_play {
     Path(beatmap_id): Path<u64>,
     Query(params): Query<SimulatePlayQueryParams>,
   ) -> Result<Json<SimulatePlayResponse>, APIError> {
-    let beatmap = download_beatmap(beatmap_id).await?;
-    let pp = simulate_play(&beatmap, &params).await?;
-    Ok(Json(SimulatePlayResponse { pp }))
+    let endpoint_name = "simulate_play";
+    http_server::requests_total(endpoint_name).inc();
+    let pp_res = try {
+      let beatmap = download_beatmap(beatmap_id).await?;
+      let diff_attrs = compute_diff_attrs(&beatmap, params.mods.as_deref().unwrap_or_default())?;
+      simulate_play(diff_attrs, &params).await?
+    };
+    match pp_res {
+      Ok(pp) => {
+        http_server::requests_success_total(endpoint_name).inc();
+        Ok(Json(SimulatePlayResponse { pp }))
+      },
+      Err(err) => {
+        http_server::requests_failed_total(endpoint_name).inc();
+        Err(err)
+      },
+    }
   }
 
   #[derive(Deserialize)]
@@ -316,19 +340,43 @@ mod simulate_play {
   pub(super) async fn batch_simulate_play_route(
     body: String,
   ) -> Result<Json<BatchSimulatePlayResponse>, APIError> {
-    let BatchSimulatePlayParams { beatmap_id, params } =
-      serde_json::from_str(&body).map_err(|err| APIError {
-        status: StatusCode::BAD_REQUEST,
-        message: format!("Error parsing request body: {err}"),
-      })?;
+    let endpoint_name = "batch_simulate_play";
+    let pps_res = try {
+      let BatchSimulatePlayParams { beatmap_id, params } =
+        serde_json::from_str(&body).map_err(|err| APIError {
+          status: StatusCode::BAD_REQUEST,
+          message: format!("Error parsing request body: {err}"),
+        })?;
 
-    let beatmap = download_beatmap(beatmap_id).await?;
-    let mut pps = Vec::new();
-    for params in params {
-      let pp = simulate_play(&beatmap, &params).await?;
-      pps.push(pp);
+      let beatmap = download_beatmap(beatmap_id).await?;
+      let Some(first_params) = params.first() else {
+        return Ok(Json(BatchSimulatePlayResponse { pp: Vec::new() }));
+      };
+      let mut last_mods = first_params.mods.clone();
+      let mut diff_attrs = compute_diff_attrs(&beatmap, last_mods.as_deref().unwrap_or_default())?;
+      let mut pps = Vec::new();
+      for params in params {
+        if params.mods != last_mods {
+          last_mods = params.mods.clone();
+          diff_attrs = compute_diff_attrs(&beatmap, last_mods.as_deref().unwrap_or_default())?;
+        }
+
+        let pp = simulate_play(diff_attrs.clone(), &params).await?;
+        pps.push(pp);
+      }
+
+      pps
+    };
+    match pps_res {
+      Ok(pps) => {
+        http_server::requests_success_total(endpoint_name).inc();
+        Ok(Json(BatchSimulatePlayResponse { pp: pps }))
+      },
+      Err(err) => {
+        http_server::requests_failed_total(endpoint_name).inc();
+        Err(err)
+      },
     }
-    Ok(Json(BatchSimulatePlayResponse { pp: pps }))
   }
 }
 
