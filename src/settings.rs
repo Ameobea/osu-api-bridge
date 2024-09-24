@@ -7,6 +7,12 @@ pub struct SqlSettings {
   pub db_url: String,
 }
 
+#[cfg(feature = "daily_challenge")]
+#[settings]
+pub struct DailyChallengeSettings {
+  pub admin_token: String,
+}
+
 #[settings]
 pub struct ServerSettings {
   /// Telemetry settings.
@@ -21,4 +27,6 @@ pub struct ServerSettings {
   pub osu_client_secret: String,
   #[cfg(feature = "sql")]
   pub sql: SqlSettings,
+  #[cfg(feature = "daily_challenge")]
+  pub daily_challenge: DailyChallengeSettings,
 }

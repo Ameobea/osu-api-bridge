@@ -148,12 +148,13 @@ impl HiscoreV2 {
   }
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Mod {
   pub acronym: String,
+  pub settings: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Statistics {
   pub ok: Option<i64>,
   pub meh: Option<i64>,
@@ -240,10 +241,10 @@ impl<'de> Deserialize<'de> for Ruleset {
   }
 }
 
-async fn get_auth_header() -> Result<String, APIError> {
+async fn get_auth_header(endpoint_name: &'static str) -> Result<String, APIError> {
   crate::oauth::get_auth_header().await.map_err(|err| {
-    error!("Failed to get auth header: {}", err);
-    http_server::osu_api_requests_failed_total("fetch_user_hiscores", 0).inc();
+    error!("Failed to get auth header: {err:?}");
+    http_server::osu_api_requests_failed_total(endpoint_name, 0).inc();
     APIError {
       status: StatusCode::INTERNAL_SERVER_ERROR,
       message: "Failed to get auth header".to_owned(),
@@ -251,18 +252,29 @@ async fn get_auth_header() -> Result<String, APIError> {
   })
 }
 
-async fn make_osu_api_request(
+#[cfg(feature = "sql")]
+async fn get_user_auth_header(endpoint_name: &'static str) -> Result<String, APIError> {
+  crate::oauth::get_user_auth_header().await.map_err(|err| {
+    error!("Failed to get user auth header: {err:?}");
+    http_server::osu_api_requests_failed_total(endpoint_name, 0).inc();
+    APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: "Failed to get user auth header".to_owned(),
+    }
+  })
+}
+
+async fn make_osu_api_request_inner(
   url: &str,
   endpoint_name: &'static str,
   method: Method,
+  auth_header: String,
 ) -> Result<String, APIError> {
-  let auth_header = get_auth_header().await?;
-
   let now = Instant::now();
   let res = REQWEST_CLIENT
     .request(method, url)
     .header("Content-Type", "application/json")
-    .header("x-api-version", "20220705")
+    .header("x-api-version", "20240923")
     .header("Accept", "application/json")
     .header("Authorization", auth_header)
     .send()
@@ -291,6 +303,25 @@ async fn make_osu_api_request(
       message: "Failed to response from osu! API".to_owned(),
     }
   })
+}
+
+async fn make_osu_api_request(
+  url: &str,
+  endpoint_name: &'static str,
+  method: Method,
+) -> Result<String, APIError> {
+  let auth_header = get_auth_header(endpoint_name).await?;
+  make_osu_api_request_inner(url, endpoint_name, method, auth_header).await
+}
+
+#[cfg(feature = "sql")]
+async fn make_osu_user_api_request(
+  url: &str,
+  endpoint_name: &'static str,
+  method: Method,
+) -> Result<String, APIError> {
+  let auth_header = get_user_auth_header(endpoint_name).await?;
+  make_osu_api_request_inner(url, endpoint_name, method, auth_header).await
 }
 
 // curl --request GET \
@@ -371,5 +402,180 @@ pub async fn fetch_user_id(username: &str, mode: Ruleset) -> Result<u64, APIErro
         message: "Failed to parse user response".to_owned(),
       })
     },
+  }
+}
+
+#[cfg(feature = "daily_challenge")]
+pub mod daily_challenge {
+  use chrono::DateTime;
+  use reqwest::StatusCode;
+  use serde::Deserialize;
+
+  use crate::server::APIError;
+
+  #[derive(Deserialize)]
+  pub struct DailyChallengeScore {
+    pub preserve: bool,
+    pub processed: bool,
+    pub ranked: bool,
+    pub mods: Vec<super::Mod>,
+    pub statistics: super::Statistics,
+    pub total_score_without_mods: i64,
+    pub beatmap_id: i64,
+    pub id: i64,
+    pub rank: String,
+    #[serde(rename = "type")]
+    pub type_field: String,
+    pub user_id: i64,
+    pub accuracy: f64,
+    pub build_id: i64,
+    pub ended_at: String,
+    pub has_replay: bool,
+    pub is_perfect_combo: bool,
+    pub max_combo: usize,
+    pub passed: bool,
+    pub pp: Option<f64>,
+    pub ruleset_id: usize,
+    pub started_at: DateTime<chrono::Utc>,
+    pub total_score: usize,
+    pub replay: bool,
+  }
+
+  #[derive(Debug)]
+  pub struct DailyChallengeIDs {
+    /// like 20240420
+    pub day_id: usize,
+    pub room_id: i64,
+    pub playlist_id: i64,
+  }
+
+  fn get_day_id(starts_at: chrono::DateTime<chrono::Utc>) -> Result<usize, APIError> {
+    let date = starts_at.format("%Y%m%d").to_string();
+    date.parse().map_err(|err| {
+      error!("Failed to parse date: {err}");
+      APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: "Failed to daily challenge room start date into day ID".to_owned(),
+      }
+    })
+  }
+
+  /// If `active` is true, only the current daily challenge is returned.  Otherwise, only past/ended
+  /// daily challenges are returned.
+  pub async fn get_daily_challenge_ids(
+    active: bool,
+  ) -> Result<Vec<DailyChallengeIDs>, super::APIError> {
+    let endpoint_name = "get_daily_challenge_room_id";
+    let url = format!(
+      "https://osu.ppy.sh/api/v2/rooms?category=daily_challenge&mode={}",
+      if active { "active" } else { "ended" }
+    );
+    let res_text =
+      super::make_osu_user_api_request(&url, endpoint_name, reqwest::Method::GET).await?;
+
+    #[derive(Deserialize)]
+    struct CurrentPlaylistItem {
+      pub id: i64,
+    }
+
+    #[derive(Deserialize)]
+    struct Room {
+      pub id: i64,
+      pub current_playlist_item: CurrentPlaylistItem,
+      pub starts_at: chrono::DateTime<chrono::Utc>,
+    }
+
+    type GetDailyChallengeRoomIdsResponse = Vec<Room>;
+
+    let deserializer = &mut serde_json::Deserializer::from_str(&res_text);
+    match serde_path_to_error::deserialize::<_, GetDailyChallengeRoomIdsResponse>(deserializer) {
+      Ok(rooms) => Ok(
+        rooms
+          .into_iter()
+          .map(|r| {
+            Ok(DailyChallengeIDs {
+              day_id: get_day_id(r.starts_at)?,
+              room_id: r.id,
+              playlist_id: r.current_playlist_item.id,
+            })
+          })
+          .collect::<Result<_, _>>()?,
+      ),
+      Err(err) => {
+        error!("Failed to parse daily challenge room response; res: {res_text}; err: {err}");
+        super::http_server::osu_api_requests_failed_total(endpoint_name, 200).inc();
+        Err(super::APIError {
+          status: StatusCode::INTERNAL_SERVER_ERROR,
+          message: "Failed to parse daily challenge room response".to_owned(),
+        })
+      },
+    }
+  }
+
+  struct FetchDailyScoresPage {
+    pub scores: Vec<DailyChallengeScore>,
+    pub cursor_string: Option<String>,
+  }
+
+  // https://osu.ppy.sh/api/v2/rooms/898511/playlist/9530696/scores?limit=50&cursor_string=<...>
+  async fn fetch_daily_challenge_scores_page(
+    ids: &DailyChallengeIDs,
+    cursor_string: Option<&str>,
+  ) -> Result<FetchDailyScoresPage, super::APIError> {
+    let endpoint_name = "fetch_daily_challenge_scores";
+    let proxy_url = format!(
+      "https://osu.ppy.sh/api/v2/rooms/{}/playlist/{}/scores?limit=50&cursor_string={}",
+      ids.room_id,
+      ids.playlist_id,
+      cursor_string.unwrap_or("")
+    );
+    let res_text =
+      super::make_osu_user_api_request(&proxy_url, endpoint_name, reqwest::Method::GET).await?;
+
+    #[derive(Deserialize)]
+    struct ScoresResponse {
+      pub scores: Vec<DailyChallengeScore>,
+      pub cursor_string: Option<String>,
+    }
+
+    let deserializer = &mut serde_json::Deserializer::from_str(&res_text);
+    match serde_path_to_error::deserialize::<_, ScoresResponse>(deserializer) {
+      Ok(res) => Ok(FetchDailyScoresPage {
+        scores: res.scores,
+        cursor_string: res.cursor_string,
+      }),
+      Err(err) => {
+        error!("Failed to parse daily challenge scores response; res: {res_text}; err: {err}");
+        super::http_server::osu_api_requests_failed_total(endpoint_name, 200).inc();
+        Err(super::APIError {
+          status: StatusCode::INTERNAL_SERVER_ERROR,
+          message: "Failed to parse daily challenge scores response".to_owned(),
+        })
+      },
+    }
+  }
+
+  /// Fetch all scores for a daily challenge, pulling all pages.
+  pub async fn fetch_daily_challenge_scores(
+    ids: &DailyChallengeIDs,
+  ) -> Result<Vec<DailyChallengeScore>, super::APIError> {
+    let mut all_scores = Vec::new();
+    let mut cursor_string = None;
+    let mut page_ix = 0usize;
+    loop {
+      info!("Fetching daily challenge scores page {page_ix}");
+      let page = fetch_daily_challenge_scores_page(ids, cursor_string.as_deref()).await?;
+      let page_score_count = page.scores.len();
+      all_scores.extend(page.scores);
+      if page.cursor_string.is_none() || page_score_count < 50 {
+        break;
+      }
+
+      cursor_string = page.cursor_string;
+      tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+      page_ix += 1;
+    }
+
+    Ok(all_scores)
   }
 }

@@ -1,3 +1,12 @@
+code:
+  RUSTFLAGS="--cfg tokio_unstable --cfg foundations_unstable" code .
+
+generate-default-config:
+  RUSTFLAGS="--cfg tokio_unstable --cfg foundations_unstable" RUST_LOG=debug cargo run -- --generate default-config.yml
+
+migrate:
+  sqlx migrate run
+
 docker-build:
   docker build --network host -t ameo/osu-api-bridge:latest .
 

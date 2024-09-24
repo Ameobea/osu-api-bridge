@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 use axum::{
   extract::{Path, Query},
   http::StatusCode,
@@ -33,6 +36,7 @@ struct GetHiscoresParams {
   offset: Option<u8>,
 }
 
+#[derive(Debug)]
 pub struct APIError {
   pub status: StatusCode,
   pub message: String,
@@ -186,24 +190,14 @@ async fn get_user_id(
 
 #[cfg(feature = "simulate_play")]
 mod simulate_play {
-  use serde::Serialize;
   use std::{io::Read, str::FromStr};
 
   use rosu_pp::{any::DifficultyAttributes, Beatmap, Performance};
-  use rosu_v2::model::GameMods;
-  use tokio::sync::OnceCell;
+  use rosu_v2::model::mods::GameModsLegacy;
+  use serde::Serialize;
 
   use super::*;
-
-  static DB_POOL: OnceCell<sqlx::MySqlPool> = OnceCell::const_new();
-
-  pub(super) async fn init_db_pool(db_url: &str) -> BootstrapResult<()> {
-    let pool = sqlx::MySqlPool::connect(db_url).await?;
-    DB_POOL.set(pool).unwrap();
-    Ok(())
-  }
-
-  fn db_pool() -> &'static sqlx::MySqlPool { DB_POOL.get().expect("DB pool not initialized") }
+  use crate::db::db_pool;
 
   async fn download_beatmap(beatmap_id: u64) -> Result<Beatmap, APIError> {
     let beatmap = sqlx::query_scalar!(
@@ -243,7 +237,7 @@ mod simulate_play {
     beatmap: &Beatmap,
     mod_string: &str,
   ) -> Result<DifficultyAttributes, APIError> {
-    let mods = GameMods::from_str(mod_string).map_err(|err| APIError {
+    let mods = GameModsLegacy::from_str(mod_string).map_err(|err| APIError {
       status: StatusCode::BAD_REQUEST,
       message: format!("Invalid mods: {err}"),
     })?;
@@ -259,9 +253,11 @@ mod simulate_play {
     params: &SimulatePlayQueryParams,
   ) -> Result<f64, APIError> {
     let mods =
-      GameMods::from_str(params.mods.as_deref().unwrap_or_default()).map_err(|err| APIError {
-        status: StatusCode::BAD_REQUEST,
-        message: format!("Invalid mods: {err}"),
+      GameModsLegacy::from_str(params.mods.as_deref().unwrap_or_default()).map_err(|err| {
+        APIError {
+          status: StatusCode::BAD_REQUEST,
+          message: format!("Invalid mods: {err}"),
+        }
       })?;
 
     let mut perf = Performance::new(diff_attrs).mods(mods.bits());
@@ -380,11 +376,151 @@ mod simulate_play {
   }
 }
 
+lazy_static::lazy_static! {
+  static ref SETTINGS: ArcSwap<ServerSettings> = ArcSwap::new(Arc::new(ServerSettings::default()));
+}
+
+#[cfg(feature = "daily_challenge")]
+mod daily_challenge {
+  use chrono::DateTime;
+  use sqlx::{Executor, MySql, QueryBuilder};
+
+  use crate::{
+    db::db_pool,
+    osu_api::{self, daily_challenge::DailyChallengeScore},
+  };
+
+  use super::*;
+
+  async fn store_daily_challenge_scores(
+    day_id: usize,
+    scores: Vec<DailyChallengeScore>,
+  ) -> sqlx::Result<()> {
+    let pool = db_pool();
+    let mut txn = pool.begin().await.unwrap();
+
+    // CREATE TABLE daily_challenge_rankings (
+    //   day_id INT NOT NULL,
+    //   user_id INT NOT NULL,
+    //   score_id BIGINT NOT NULL,
+    //   pp FLOAT NULL,
+    //   rank VARCHAR(255) NULL,
+    //   statistics JSON NULL,
+    //   total_score INT NOT NULL,
+    //   started_at TIMESTAMP NULL,
+    //   mods JSON NULL,
+    //   max_combo INT NOT NULL,
+    //   accuracy FLOAT NOT NULL
+    // );
+    struct InsertableScore {
+      day_id: i64,
+      user_id: i64,
+      score_id: i64,
+      pp: Option<f64>,
+      rank: Option<String>,
+      statistics: String,
+      total_score: i64,
+      started_at: DateTime<chrono::Utc>,
+      mods: String,
+      max_combo: i64,
+      accuracy: f64,
+    }
+
+    for scores in scores.chunks(50) {
+      let mut qb: QueryBuilder<'_, MySql> = QueryBuilder::new(
+        "INSERT INTO daily_challenge_rankings (day_id, user_id, score_id, pp, rank, statistics, \
+         total_score, started_at, mods, max_combo, accuracy) ",
+      );
+      let scores = scores
+        .iter()
+        .map(|score| InsertableScore {
+          day_id: day_id as _,
+          user_id: score.user_id,
+          score_id: score.id,
+          pp: score.pp,
+          rank: Some(score.rank.clone()),
+          statistics: serde_json::to_string(&score.statistics).unwrap(),
+          total_score: score.total_score as _,
+          started_at: score.started_at,
+          mods: serde_json::to_string(&score.mods).unwrap(),
+          max_combo: score.max_combo as _,
+          accuracy: score.accuracy,
+        })
+        .collect::<Vec<_>>();
+      qb.push_values(scores, |mut b, score| {
+        b.push_bind(score.day_id)
+          .push_bind(score.user_id)
+          .push_bind(score.score_id)
+          .push_bind(score.pp)
+          .push_bind(score.rank)
+          .push_bind(score.statistics)
+          .push_bind(score.total_score)
+          .push_bind(score.started_at)
+          .push_bind(score.mods)
+          .push_bind(score.max_combo)
+          .push_bind(score.accuracy);
+      });
+
+      qb.push(
+        "ON DUPLICATE KEY UPDATE pp = VALUES(pp), rank = VALUES(rank), statistics = \
+         VALUES(statistics), total_score = VALUES(total_score), started_at = VALUES(started_at), \
+         mods = VALUES(mods), max_combo = VALUES(max_combo), accuracy = VALUES(accuracy)",
+      );
+      let query = qb.build();
+      txn.execute(query).await?;
+    }
+
+    txn.commit().await
+  }
+
+  pub(super) async fn backfill_daily_challenges(admin_api_token: String) -> Result<(), APIError> {
+    if admin_api_token != SETTINGS.load().daily_challenge.admin_token {
+      return Err(APIError {
+        status: StatusCode::UNAUTHORIZED,
+        message: "Missing or invalid admin API token in request body".to_string(),
+      });
+    }
+
+    let all_daily_challenge_ids = osu_api::daily_challenge::get_daily_challenge_ids(false).await?;
+
+    info!(
+      "Found {} daily challenges to backfill: {:?}",
+      all_daily_challenge_ids.len(),
+      all_daily_challenge_ids
+    );
+
+    for ids in all_daily_challenge_ids {
+      info!("Fetching daily challenge scores for {}...", ids.day_id);
+      let scores = osu_api::daily_challenge::fetch_daily_challenge_scores(&ids).await?;
+      info!(
+        "Fetched {} scores for daily challenge {}.  Storing...",
+        scores.len(),
+        ids.day_id
+      );
+
+      match store_daily_challenge_scores(ids.day_id, scores).await {
+        Ok(_) => info!(
+          "Successfully stored daily challenge scores for {}",
+          ids.day_id
+        ),
+        Err(err) => error!(
+          "Failed to store daily challenge scores for {}: {err}",
+          ids.day_id
+        ),
+      }
+    }
+
+    Ok(())
+  }
+}
+
 pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
   set_client_info(settings.osu_client_id, settings.osu_client_secret.clone());
 
-  #[cfg(feature = "simulate_play")]
-  simulate_play::init_db_pool(&settings.sql.db_url).await?;
+  SETTINGS.store(Arc::new(settings.clone()));
+
+  #[cfg(feature = "sql")]
+  crate::db::init_db_pool(&settings.sql.db_url).await?;
 
   let mut router = Router::new()
     .route("/", axum::routing::get(index))
@@ -410,6 +546,14 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
         "/beatmaps/:beatmap_id/simulate/batch",
         axum::routing::post(simulate_play::batch_simulate_play_route),
       );
+  }
+
+  #[cfg(feature = "daily_challenge")]
+  {
+    router = router.route(
+      "/daily-challenge/backfill",
+      axum::routing::post(daily_challenge::backfill_daily_challenges),
+    );
   }
 
   router = router

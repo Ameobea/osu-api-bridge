@@ -13,6 +13,8 @@ use foundations::{
 use server::start_server;
 use settings::ServerSettings;
 
+#[cfg(feature = "sql")]
+mod db;
 mod metrics;
 mod mods;
 mod oauth;
