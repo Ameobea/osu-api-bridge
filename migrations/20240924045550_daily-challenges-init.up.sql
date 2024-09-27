@@ -7,6 +7,7 @@ CREATE TABLE daily_challenge_rankings (
   statistics JSON NULL,
   total_score INT NOT NULL,
   started_at TIMESTAMP NULL,
+  ended_at TIMESTAMP NULL,
   mods JSON NULL,
   max_combo INT NOT NULL,
   accuracy FLOAT NOT NULL

@@ -61,7 +61,6 @@ pub struct HiscoreV2 {
   pub replay: bool,
   pub beatmap: Beatmap,
   pub user: User,
-  pub weight: Weight,
 }
 
 fn unacronym_mods<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -174,35 +173,8 @@ pub struct Beatmap {
 }
 
 #[derive(Deserialize)]
-pub struct Beatmapset {
-  pub id: i64,
-}
-
-#[derive(Deserialize)]
-pub struct Covers {
-  pub cover: String,
-  #[serde(rename = "cover@2x")]
-  pub cover_2x: String,
-  pub card: String,
-  #[serde(rename = "card@2x")]
-  pub card_2x: String,
-  pub list: String,
-  #[serde(rename = "list@2x")]
-  pub list_2x: String,
-  pub slimcover: String,
-  #[serde(rename = "slimcover@2x")]
-  pub slimcover_2x: String,
-}
-
-#[derive(Deserialize)]
 pub struct User {
   pub id: u64,
-}
-
-#[derive(Deserialize)]
-pub struct Weight {
-  pub percentage: f64,
-  pub pp: Option<f64>,
 }
 
 pub enum Ruleset {
@@ -427,14 +399,14 @@ pub mod daily_challenge {
     #[serde(rename = "type")]
     pub type_field: String,
     pub user_id: i64,
-    pub accuracy: f64,
+    pub accuracy: f32,
     pub build_id: i64,
-    pub ended_at: String,
+    pub ended_at: DateTime<chrono::Utc>,
     pub has_replay: bool,
     pub is_perfect_combo: bool,
     pub max_combo: usize,
     pub passed: bool,
-    pub pp: Option<f64>,
+    pub pp: Option<f32>,
     pub ruleset_id: usize,
     pub started_at: DateTime<chrono::Utc>,
     pub total_score: usize,

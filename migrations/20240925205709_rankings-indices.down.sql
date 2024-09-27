@@ -1,0 +1,2 @@
+DROP INDEX daily_challenge_rankings_user_id_idx ON daily_challenge_rankings;
+DROP INDEX daily_challenge_rankings_day_id_idx ON daily_challenge_rankings;
