@@ -1,13 +1,13 @@
 use std::{fmt::Display, time::Instant};
 
-use crate::{
-  metrics::http_server, mods::build_mods_bitmap, oauth::REQWEST_CLIENT, server::APIError,
-};
-
 use axum::http::StatusCode;
 use reqwest::Method;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+
+use crate::{
+  metrics::http_server, mods::build_mods_bitmap, oauth::REQWEST_CLIENT, server::APIError,
+};
 
 #[derive(Serialize)]
 pub struct HiscoreV1 {
@@ -165,11 +165,56 @@ pub struct Statistics {
   pub small_bonus: Option<i64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
+pub struct Covers {
+  pub cover: String,
+  #[serde(rename = "cover@2x")]
+  pub cover_2x: String,
+  pub card: String,
+  #[serde(rename = "card@2x")]
+  pub card_2x: String,
+  pub list: String,
+  #[serde(rename = "list@2x")]
+  pub list_2x: String,
+  pub slimcover: String,
+  #[serde(rename = "slimcover@2x")]
+  pub slimcover_2x: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Beatmapset {
+  pub artist: String,
+  pub artist_unicode: String,
+  pub covers: Covers,
+  pub creator: String,
+  pub favourite_count: i64,
+  pub hype: Value,
+  pub id: i64,
+  pub nsfw: bool,
+  pub offset: i64,
+  pub play_count: i64,
+  pub preview_url: String,
+  pub source: String,
+  pub spotlight: bool,
+  pub status: String,
+  pub title: String,
+  pub title_unicode: String,
+  pub track_id: Value,
+  pub user_id: i64,
+  pub video: bool,
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct Beatmap {
   pub beatmapset_id: i64,
+  pub difficulty_rating: f32,
   pub id: i64,
   pub mode: String,
+  pub status: String,
+  pub total_length: i64,
+  pub user_id: i64,
+  pub version: String,
+  pub beatmapset: Beatmapset,
 }
 
 #[derive(Deserialize)]
@@ -381,9 +426,11 @@ pub async fn fetch_user_id(username: &str, mode: Ruleset) -> Result<u64, APIErro
 pub mod daily_challenge {
   use chrono::DateTime;
   use reqwest::StatusCode;
-  use serde::Deserialize;
+  use serde::{Deserialize, Serialize};
 
   use crate::server::APIError;
+
+  use super::Beatmap;
 
   #[derive(Deserialize)]
   pub struct DailyChallengeScore {
@@ -413,12 +460,13 @@ pub mod daily_challenge {
     pub replay: bool,
   }
 
-  #[derive(Debug)]
-  pub struct DailyChallengeIDs {
+  #[derive(Serialize)]
+  pub struct NewDailyChallengeDescriptor {
     /// like 20240420
     pub day_id: usize,
     pub room_id: i64,
     pub playlist_id: i64,
+    pub current_playlist_item: CurrentPlaylistItem,
   }
 
   fn get_day_id(starts_at: chrono::DateTime<chrono::Utc>) -> Result<usize, APIError> {
@@ -432,11 +480,34 @@ pub mod daily_challenge {
     })
   }
 
+  #[derive(Serialize, Deserialize)]
+  pub struct CurrentPlaylistItem {
+    pub id: i64,
+    pub room_id: i64,
+    pub allowed_mods: Vec<serde_json::Map<String, serde_json::Value>>,
+    pub required_mods: Vec<serde_json::Map<String, serde_json::Value>>,
+    pub beatmap: Beatmap,
+  }
+
+  #[derive(Deserialize)]
+  struct DifficultyRange {
+    min: f32,
+    max: f32,
+  }
+
+  #[derive(Deserialize)]
+  struct Room {
+    pub id: i64,
+    pub current_playlist_item: CurrentPlaylistItem,
+    pub difficulty_range: DifficultyRange,
+    pub starts_at: chrono::DateTime<chrono::Utc>,
+  }
+
   /// If `active` is true, only the current daily challenge is returned.  Otherwise, only past/ended
   /// daily challenges are returned.
-  pub async fn get_daily_challenge_ids(
+  pub async fn get_daily_challenge_descriptors(
     active: bool,
-  ) -> Result<Vec<DailyChallengeIDs>, super::APIError> {
+  ) -> Result<Vec<NewDailyChallengeDescriptor>, super::APIError> {
     let endpoint_name = "get_daily_challenge_room_id";
     let url = format!(
       "https://osu.ppy.sh/api/v2/rooms?category=daily_challenge&mode={}",
@@ -444,18 +515,6 @@ pub mod daily_challenge {
     );
     let res_text =
       super::make_osu_user_api_request(&url, endpoint_name, reqwest::Method::GET).await?;
-
-    #[derive(Deserialize)]
-    struct CurrentPlaylistItem {
-      pub id: i64,
-    }
-
-    #[derive(Deserialize)]
-    struct Room {
-      pub id: i64,
-      pub current_playlist_item: CurrentPlaylistItem,
-      pub starts_at: chrono::DateTime<chrono::Utc>,
-    }
 
     type GetDailyChallengeRoomIdsResponse = Vec<Room>;
 
@@ -465,10 +524,11 @@ pub mod daily_challenge {
         rooms
           .into_iter()
           .map(|r| {
-            Ok(DailyChallengeIDs {
+            Ok(NewDailyChallengeDescriptor {
               day_id: get_day_id(r.starts_at)?,
               room_id: r.id,
               playlist_id: r.current_playlist_item.id,
+              current_playlist_item: r.current_playlist_item,
             })
           })
           .collect::<Result<_, _>>()?,
@@ -491,7 +551,7 @@ pub mod daily_challenge {
 
   // https://osu.ppy.sh/api/v2/rooms/898511/playlist/9530696/scores?limit=50&cursor_string=<...>
   async fn fetch_daily_challenge_scores_page(
-    ids: &DailyChallengeIDs,
+    ids: &NewDailyChallengeDescriptor,
     cursor_string: Option<&str>,
   ) -> Result<FetchDailyScoresPage, super::APIError> {
     let endpoint_name = "fetch_daily_challenge_scores";
@@ -529,7 +589,7 @@ pub mod daily_challenge {
 
   /// Fetch all scores for a daily challenge, pulling all pages.
   pub async fn fetch_daily_challenge_scores(
-    ids: &DailyChallengeIDs,
+    ids: &NewDailyChallengeDescriptor,
   ) -> Result<Vec<DailyChallengeScore>, super::APIError> {
     let mut all_scores = Vec::new();
     let mut cursor_string = None;

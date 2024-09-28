@@ -239,9 +239,17 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
         axum::routing::post(daily_challenge::backfill_daily_challenges),
       )
       .route(
-        "/daily-challenge/:user_id/history",
+        "/daily-challenge/user/:user_id/history",
         axum::routing::get(daily_challenge::get_user_daily_challenge_history),
-      );
+      )
+      .route(
+        "/daily-challenge/user/:user_id/day/:day_id",
+        axum::routing::get(daily_challenge::get_user_daily_challenge_for_day),
+      )
+      .route(
+        "/daily-challenge/day/:day_id/stats",
+        axum::routing::get(daily_challenge::get_daily_challenge_stats_for_day),
+      )
   }
 
   router = router

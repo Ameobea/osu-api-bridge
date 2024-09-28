@@ -21,6 +21,7 @@ mod oauth;
 mod osu_api;
 mod server;
 mod settings;
+mod util;
 
 async fn start() -> BootstrapResult<()> {
   let service_info = foundations::service_info!();
