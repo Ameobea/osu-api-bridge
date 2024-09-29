@@ -10,6 +10,7 @@ use axum::{
 use float_ord::FloatOrd;
 use foundations::BootstrapResult;
 use serde::Deserialize;
+use tokio::sync::OnceCell;
 use tower_http::{
   cors,
   trace::{DefaultMakeSpan, DefaultOnResponse},
@@ -193,14 +194,47 @@ async fn get_user_id(
   }
 }
 
-lazy_static::lazy_static! {
-  static ref SETTINGS: ArcSwap<ServerSettings> = ArcSwap::new(Arc::new(ServerSettings::default()));
+async fn get_username(Path(user_id): Path<u64>) -> Result<Json<String>, APIError> {
+  let endpoint_name = "get_username";
+  http_server::requests_total(endpoint_name).inc();
+
+  // first check local DB to avoid osu! API roundtrip
+  #[cfg(feature = "sql")]
+  {
+    let mut conn = crate::db::conn().await?;
+    let query = sqlx::query_scalar!("SELECT username FROM users WHERE osu_id = ?", user_id);
+    match query.fetch_optional(&mut *conn).await {
+      Ok(Some(username)) => {
+        http_server::requests_success_total(endpoint_name).inc();
+        return Ok(Json(username));
+      },
+      Err(err) => {
+        error!("Error fetching username from DB: {}", err);
+      },
+      _ => (),
+    }
+  }
+
+  match crate::osu_api::fetch_username(user_id).await {
+    Ok(username) => {
+      http_server::requests_success_total(endpoint_name).inc();
+      Ok(Json(username))
+    },
+    Err(err) => {
+      http_server::requests_failed_total(endpoint_name).inc();
+      Err(err)
+    },
+  }
 }
+
+static SETTINGS: OnceCell<ServerSettings> = OnceCell::const_new();
 
 pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
   set_client_info(settings.osu_client_id, settings.osu_client_secret.clone());
 
-  SETTINGS.store(Arc::new(settings.clone()));
+  SETTINGS
+    .set(settings.clone())
+    .expect("SETTINGS already set?");
 
   #[cfg(feature = "sql")]
   crate::db::init_db_pool(&settings.sql.db_url).await?;
@@ -216,7 +250,8 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
       "/users/:user_id/beatmaps/:beatmap_id/best",
       axum::routing::get(get_user_best_score_for_beatmap),
     )
-    .route("/users/:username/id", axum::routing::get(get_user_id));
+    .route("/users/:username/id", axum::routing::get(get_user_id))
+    .route("/users/:user_id/username", axum::routing::get(get_username));
 
   #[cfg(feature = "simulate_play")]
   {
@@ -245,6 +280,10 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
       .route(
         "/daily-challenge/user/:user_id/day/:day_id",
         axum::routing::get(daily_challenge::get_user_daily_challenge_for_day),
+      )
+      .route(
+        "/daily-challenge/user/:user_id/stats",
+        axum::routing::get(daily_challenge::get_user_daily_challenge_stats),
       )
       .route(
         "/daily-challenge/day/:day_id/stats",

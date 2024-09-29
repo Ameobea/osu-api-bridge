@@ -220,6 +220,7 @@ pub struct Beatmap {
 #[derive(Deserialize)]
 pub struct User {
   pub id: u64,
+  pub username: String,
 }
 
 pub enum Ruleset {
@@ -411,6 +412,25 @@ pub async fn fetch_user_id(username: &str, mode: Ruleset) -> Result<u64, APIErro
   let deserializer = &mut serde_json::Deserializer::from_str(&res_text);
   match serde_path_to_error::deserialize::<_, User>(deserializer) {
     Ok(user) => Ok(user.id),
+    Err(err) => {
+      error!("Failed to parse user response; res: {res_text}; err: {err}");
+      http_server::osu_api_requests_failed_total(endpoint_name, 200).inc();
+      Err(APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: "Failed to parse user response".to_owned(),
+      })
+    },
+  }
+}
+
+pub async fn fetch_username(user_id: u64) -> Result<String, APIError> {
+  let endpoint_name = "get_username";
+  let proxy_url = format!("https://osu.ppy.sh/api/v2/users/{user_id}");
+  let res_text = make_osu_api_request(&proxy_url, endpoint_name, Method::GET).await?;
+
+  let deserializer = &mut serde_json::Deserializer::from_str(&res_text);
+  match serde_path_to_error::deserialize::<_, User>(deserializer) {
+    Ok(user) => Ok(user.username),
     Err(err) => {
       error!("Failed to parse user response; res: {res_text}; err: {err}");
       http_server::osu_api_requests_failed_total(endpoint_name, 200).inc();

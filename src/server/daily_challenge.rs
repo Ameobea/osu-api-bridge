@@ -1,13 +1,13 @@
 use std::cmp::Reverse;
 
-use chrono::DateTime;
+use chrono::{DateTime, Datelike, Days, IsoWeek, NaiveDate, Timelike, Utc, Weekday};
 use fxhash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 use sqlx::{Executor, MySql, QueryBuilder};
 use tokio::sync::OnceCell;
 
 use crate::{
-  db::db_pool,
+  db::{conn, db_pool},
   osu_api::{
     self,
     daily_challenge::{DailyChallengeScore, NewDailyChallengeDescriptor},
@@ -74,8 +74,8 @@ pub(crate) struct UserDailyChallengeScore {
   #[serde(serialize_with = "serialize_json_bytes_opt")]
   statistics: Option<Vec<u8>>,
   total_score: i64,
-  started_at: Option<DateTime<chrono::Utc>>,
-  ended_at: Option<DateTime<chrono::Utc>>,
+  started_at: Option<DateTime<Utc>>,
+  ended_at: Option<DateTime<Utc>>,
   #[serde(serialize_with = "serialize_json_bytes_opt")]
   mods: Option<Vec<u8>>,
   max_combo: i64,
@@ -150,7 +150,7 @@ async fn store_daily_challenge_scores(
 }
 
 pub(super) async fn backfill_daily_challenges(admin_api_token: String) -> Result<(), APIError> {
-  if admin_api_token != SETTINGS.load().daily_challenge.admin_token {
+  if admin_api_token != SETTINGS.get().unwrap().daily_challenge.admin_token {
     if admin_api_token.is_empty() {
       return Err(APIError {
         status: StatusCode::BAD_REQUEST,
@@ -166,13 +166,7 @@ pub(super) async fn backfill_daily_challenges(admin_api_token: String) -> Result
   let mut all_daily_challenge_ids =
     osu_api::daily_challenge::get_daily_challenge_descriptors(false).await?;
 
-  let mut conn = db_pool().acquire().await.map_err(|err| {
-    error!("Failed to acquire DB connection for daily challenge backfill: {err}");
-    APIError {
-      status: StatusCode::INTERNAL_SERVER_ERROR,
-      message: "Failed to acquire DB connection for daily challenge backfill".to_string(),
-    }
-  })?;
+  let mut conn = conn().await?;
   let already_collected_day_ids: FxHashSet<usize> =
     sqlx::query_scalar!("SELECT day_id FROM daily_challenge_metadata;")
       .fetch_all(&mut *conn)
@@ -230,15 +224,34 @@ pub(super) async fn backfill_daily_challenges(admin_api_token: String) -> Result
     }
   }
 
-  // Update the daily challenge stats cache
-  match load_daily_challenge_stats().await {
-    Ok(new_stats) => get_daily_challenge_stats().await.store({
+  if let Some(stats_store) = DAILY_CHALLENGE_STATS.get() {
+    tokio::spawn(async move {
       info!("Refreshing daily challenge stats cache...");
-      Arc::new(new_stats)
-    }),
-    Err(err) => {
-      error!("Failed to refresh daily challenge stats cache: {err}");
-    },
+      match load_daily_challenge_stats().await {
+        Ok(new_stats) => {
+          stats_store.store(Arc::new(new_stats));
+          info!("Refreshed daily challenge stats cache");
+        },
+        Err(err) => {
+          error!("Failed to refresh daily challenge stats cache: {err}");
+        },
+      }
+    });
+  }
+
+  if let Some(rankings_store) = USER_TOTAL_SCORE_RANKINGS.get() {
+    tokio::spawn(async move {
+      info!("Refreshing user total score rankings cache...");
+      match load_user_total_score_rankings().await {
+        Ok(new_rankings) => {
+          rankings_store.store(Arc::new(new_rankings));
+          info!("Refreshed user total score rankings cache");
+        },
+        Err(err) => {
+          error!("Failed to refresh user total score rankings cache: {err:?}");
+        },
+      }
+    });
   }
 
   Ok(())
@@ -299,9 +312,9 @@ async fn load_daily_challenge_stats() -> sqlx::Result<FxHashMap<usize, DailyChal
           buckets[bucket.min(bucket_count - 1)] += 1;
         }
 
-        ScoreHistogram { min, max, buckets }
+        Histogram { min, max, buckets }
       })
-      .unwrap_or_else(|| ScoreHistogram {
+      .unwrap_or_else(|| Histogram {
         min: 0,
         max: 1_000_000,
         buckets: vec![0, 0, 0],
@@ -317,8 +330,31 @@ async fn load_daily_challenge_stats() -> sqlx::Result<FxHashMap<usize, DailyChal
   Ok(stats)
 }
 
-#[derive(Clone, Serialize)]
-pub(crate) struct ScoreHistogram {
+async fn load_user_total_score_rankings() -> Result<FxHashMap<usize, usize>, APIError> {
+  let mut conn = conn().await?;
+
+  let query = sqlx::query!(
+    "SELECT user_id FROM daily_challenge_rankings GROUP BY user_id ORDER BY SUM(total_score) DESC"
+  );
+  let rows = query.fetch_all(&mut *conn).await.map_err(|err| {
+    error!("Failed to load user total score rankings from DB: {err}");
+    APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: "Failed to load user total score rankings from DB".to_string(),
+    }
+  })?;
+
+  let mut rankings = FxHashMap::default();
+  for (zero_indexed_rank, row) in rows.into_iter().enumerate() {
+    let rank = zero_indexed_rank + 1;
+    rankings.insert(row.user_id as usize, rank);
+  }
+
+  Ok(rankings)
+}
+
+#[derive(Clone, Default, Serialize)]
+pub(crate) struct Histogram {
   min: usize,
   max: usize,
   buckets: Vec<usize>,
@@ -328,10 +364,12 @@ pub(crate) struct ScoreHistogram {
 pub struct DailyChallengeStatsForDay {
   pub descriptor: DbDailyChallengeDescriptor,
   pub total_scores: usize,
-  pub histogram: ScoreHistogram,
+  pub histogram: Histogram,
 }
 
 static DAILY_CHALLENGE_STATS: OnceCell<ArcSwap<FxHashMap<usize, DailyChallengeStatsForDay>>> =
+  OnceCell::const_new();
+static USER_TOTAL_SCORE_RANKINGS: OnceCell<ArcSwap<FxHashMap<usize, usize>>> =
   OnceCell::const_new();
 
 async fn get_daily_challenge_stats() -> &'static ArcSwap<FxHashMap<usize, DailyChallengeStatsForDay>>
@@ -342,6 +380,20 @@ async fn get_daily_challenge_stats() -> &'static ArcSwap<FxHashMap<usize, DailyC
       let stats = load_daily_challenge_stats().await.unwrap();
       info!("Fetched {} daily challenge stats from DB", stats.len());
       ArcSwap::new(Arc::new(stats))
+    })
+    .await
+}
+
+async fn get_user_total_score_rankings() -> &'static ArcSwap<FxHashMap<usize, usize>> {
+  USER_TOTAL_SCORE_RANKINGS
+    .get_or_init(|| async {
+      info!("Fetching user total score rankings from DB...");
+      let rankings = load_user_total_score_rankings().await.unwrap();
+      info!(
+        "Fetched {} user total score rankings from DB",
+        rankings.len()
+      );
+      ArcSwap::new(Arc::new(rankings))
     })
     .await
 }
@@ -366,14 +418,7 @@ pub(crate) async fn get_user_daily_challenge_history(
     end_day_id,
   }): Query<DailyChallengeHistoryQueryParams>,
 ) -> Result<Json<Vec<UserDailyChallengeHistoryEntry>>, APIError> {
-  let pool = db_pool();
-  let mut conn = pool.acquire().await.map_err(|err| {
-    error!("Failed to acquire DB connection for daily challenge stats: {err}");
-    APIError {
-      status: StatusCode::INTERNAL_SERVER_ERROR,
-      message: "Failed to acquire DB connection for daily challenge stats".to_string(),
-    }
-  })?;
+  let mut conn = conn().await?;
 
   let res: Result<Vec<UserDailyChallengeScore>, _> = match (start_day_id, end_day_id) {
     (None, None) => {
@@ -467,6 +512,332 @@ pub(crate) async fn get_user_daily_challenge_for_day(
   })?;
 
   Ok(Json(score))
+}
+
+#[derive(Default, Serialize)]
+pub(crate) struct Streaks {
+  cur_daily_streak: usize,
+  cur_weekly_streak: usize,
+  best_daily_streak: usize,
+  best_weekly_streak: usize,
+}
+
+#[derive(Default, Serialize)]
+pub(crate) struct BestPlacement {
+  day_id: usize,
+  score: usize,
+  rank: usize,
+  total_rankings: usize,
+  percentile: f32,
+}
+
+#[derive(Default, Serialize)]
+pub(crate) struct TotalScoreStats {
+  /// The sum of all scores for all daily challenges
+  total_score_sum: usize,
+  /// Rank (1 being the best) of the sum of all scores for all daily challenges compared to all
+  /// other users
+  total_score_rank: usize,
+  total_score_percentile: f32,
+}
+
+#[derive(Default, Serialize)]
+pub(crate) struct DailyChallengeUserStats {
+  pub total_participation: usize,
+  pub total_score_stats: TotalScoreStats,
+  pub score_distribution: Histogram,
+  /// Histogram with range [0, 86400] and 50 buckets indicating the distribution of times of day
+  /// that the user submitted their best daily challenge score.
+  pub time_of_day_distribution: Histogram,
+  pub streaks: Streaks,
+  pub top_10_percent_count: usize,
+  pub top_50_percent_count: usize,
+  pub best_placement_absolute: Option<BestPlacement>,
+  pub best_placement_percentile: Option<BestPlacement>,
+  pub best_placement_score: Option<BestPlacement>,
+}
+
+#[derive(sqlx::FromRow)]
+struct MinimalUserDailyChallengeScore {
+  day_id: i64,
+  user_rank: i64,
+  total_score: i64,
+  ended_at: Option<DateTime<Utc>>,
+  mods: Option<Vec<u8>>,
+}
+
+fn day_id_to_naive_date(day_id: usize) -> NaiveDate {
+  let day_id_str = format!("{day_id}");
+  NaiveDate::parse_from_str(
+    &format!(
+      "{}-{}-{}",
+      &day_id_str[0..4],
+      &day_id_str[4..6],
+      &day_id_str[6..8]
+    ),
+    "%Y-%m-%d",
+  )
+  .unwrap()
+}
+
+fn start_of_week(date: NaiveDate) -> NaiveDate {
+  // Start of week is Thursday, following osu!'s week streak calculation:
+  // https://github.com/ppy/osu-web/blob/dcfce28dd8263e141c3efac53fc356a5c5a5ec7e/app/Models/DailyChallengeUserStats.php#L90
+  let mut start = date;
+  while start.weekday() != Weekday::Thu {
+    start = start.pred_opt().unwrap();
+  }
+  start
+}
+
+fn compute_streaks(
+  scores: &[MinimalUserDailyChallengeScore],
+  last_daily_challenge_day_id: usize,
+) -> Streaks {
+  if scores.is_empty() {
+    return Streaks::default();
+  }
+
+  let mut cur_daily_streak = 1;
+  let mut best_daily_streak = 1;
+
+  let mut seen_week_ids = FxHashSet::default();
+
+  for i in 1..scores.len() {
+    let prev = &scores[i - 1];
+    let prev_date = day_id_to_naive_date(prev.day_id as usize);
+    let cur = &scores[i];
+    let cur_date = day_id_to_naive_date(cur.day_id as usize);
+
+    if prev_date.succ_opt().unwrap() == cur_date {
+      cur_daily_streak += 1;
+    } else {
+      best_daily_streak = best_daily_streak.max(cur_daily_streak);
+      cur_daily_streak = 1;
+    }
+
+    seen_week_ids.insert(start_of_week(cur_date));
+  }
+
+  let mut all_week_ids: Vec<NaiveDate> = seen_week_ids.into_iter().collect();
+  all_week_ids.sort_unstable();
+
+  let mut cur_weekly_streak = 1;
+  let mut best_weekly_streak = 1;
+
+  for i in 1..all_week_ids.len() {
+    let prev_week = &all_week_ids[i - 1];
+    let cur_week = &all_week_ids[i];
+
+    if *cur_week == prev_week.checked_add_days(Days::new(7)).unwrap() {
+      cur_weekly_streak += 1;
+    } else {
+      best_weekly_streak = best_weekly_streak.max(cur_weekly_streak);
+      cur_weekly_streak = 1;
+    }
+  }
+
+  let last_daily_challenge_date = day_id_to_naive_date(last_daily_challenge_day_id);
+  if last_daily_challenge_day_id != scores.last().unwrap().day_id as usize {
+    cur_daily_streak = 0;
+  }
+
+  let last_challenge_week = start_of_week(last_daily_challenge_date);
+  if last_challenge_week != all_week_ids.last().copied().unwrap() {
+    cur_weekly_streak = 0;
+  }
+
+  Streaks {
+    cur_daily_streak,
+    cur_weekly_streak,
+    best_daily_streak: best_daily_streak.max(cur_daily_streak),
+    best_weekly_streak: best_weekly_streak.max(cur_weekly_streak),
+  }
+}
+
+pub(crate) async fn get_user_daily_challenge_stats(
+  Path(user_id): Path<usize>,
+) -> Result<Json<DailyChallengeUserStats>, APIError> {
+  let mut conn = conn().await?;
+
+  let scores = sqlx::query_as!(
+    MinimalUserDailyChallengeScore,
+    "SELECT day_id, user_rank, total_score, ended_at, mods FROM daily_challenge_rankings WHERE \
+     user_id = ? ORDER BY day_id ASC",
+    user_id as i64
+  )
+  .fetch_all(&mut *conn)
+  .await
+  .map_err(|err| {
+    error!(
+      "Failed to load daily challenge stats from DB for user {}: {err}",
+      user_id
+    );
+    APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: "Failed to load daily challenge stats from DB".to_string(),
+    }
+  })?;
+
+  if scores.is_empty() {
+    return Ok(Json(DailyChallengeUserStats::default()));
+  }
+
+  let stats = get_daily_challenge_stats().await.load();
+
+  let mut total_score_sum = 0;
+  let (total_score_rank, total_score_percentile) = {
+    let stats = get_user_total_score_rankings().await.load();
+    let total_score_rank = stats.get(&user_id).copied().unwrap_or(0);
+    let total_user_count = stats.len();
+    (
+      total_score_rank,
+      (total_score_rank as f32) / (total_user_count as f32) * 100.,
+    )
+  };
+  let mut top_10_percent_count = 0;
+  let mut top_50_percent_count = 0;
+  let mut best_placement_absolute: BestPlacement = BestPlacement::default();
+  let mut best_placement_percentile: BestPlacement = BestPlacement::default();
+  let mut best_placement_score: BestPlacement = BestPlacement::default();
+
+  let score_histogram_bucket_count = if scores.len() < 10 {
+    10
+  } else if scores.len() < 50 {
+    25
+  } else {
+    50
+  };
+  let mut score_histogram = vec![0; score_histogram_bucket_count];
+  let score_histogram_min = 0usize;
+  let mut score_histogram_max = scores
+    .iter()
+    .map(|s| s.total_score as usize)
+    .max()
+    .unwrap_or(1_200_000)
+    .max(1_200_000);
+  if score_histogram_max > 1_500_000 {
+    score_histogram_max = 1_600_000;
+  } else if score_histogram_max > 1_400_000 {
+    score_histogram_max = 1_500_000;
+  } else if score_histogram_max > 1_300_000 {
+    score_histogram_max = 1_400_000;
+  } else if score_histogram_max > 1_200_000 {
+    score_histogram_max = 1_300_000;
+  }
+  let score_histogram_bucket_size =
+    ((score_histogram_max - score_histogram_min) / score_histogram_bucket_count).max(1);
+
+  let time_of_day_histogram_bucket_count = 24;
+  let mut time_of_day_histogram = vec![0; time_of_day_histogram_bucket_count];
+  let time_of_day_histogram_min = 0usize;
+  let time_of_day_histogram_max = 86400usize;
+  let time_of_day_histogram_bucket_size =
+    (time_of_day_histogram_max - time_of_day_histogram_min) / time_of_day_histogram_bucket_count;
+
+  let last_daily_challenge_day_id = stats.keys().max().copied().unwrap();
+  let streaks = compute_streaks(&scores, last_daily_challenge_day_id);
+
+  for score in &scores {
+    total_score_sum += score.total_score as usize;
+
+    let total_rankings = stats
+      .get(&(score.day_id as usize))
+      .map(|s| s.total_scores)
+      .unwrap_or(0);
+
+    let percentile = (score.user_rank as f32 / total_rankings as f32) * 100.;
+
+    if percentile <= 10. {
+      top_10_percent_count += 1;
+    }
+    if percentile <= 50. {
+      top_50_percent_count += 1;
+    }
+
+    if best_placement_absolute.rank == 0 || percentile < best_placement_absolute.percentile {
+      best_placement_absolute = BestPlacement {
+        day_id: score.day_id as usize,
+        score: score.total_score as usize,
+        rank: score.user_rank as usize,
+        total_rankings,
+        percentile,
+      };
+    }
+
+    if best_placement_percentile.rank == 0 || percentile < best_placement_percentile.percentile {
+      best_placement_percentile = BestPlacement {
+        day_id: score.day_id as usize,
+        score: score.total_score as usize,
+        rank: score.user_rank as usize,
+        total_rankings,
+        percentile,
+      };
+    }
+
+    if best_placement_score.score == 0 || (score.total_score as usize) > best_placement_score.score
+    {
+      best_placement_score = BestPlacement {
+        day_id: score.day_id as usize,
+        score: score.total_score as usize,
+        rank: score.user_rank as usize,
+        total_rankings,
+        percentile,
+      };
+    }
+
+    let score_bucket_index = ((score.total_score as usize - score_histogram_min)
+      .min(score_histogram_max)
+      / score_histogram_bucket_size)
+      .min(score_histogram.len() - 1);
+    score_histogram[score_bucket_index] += 1;
+
+    if let Some(ended_at) = score.ended_at {
+      let time_of_day = Timelike::num_seconds_from_midnight(&ended_at.time()) as usize;
+      let time_of_day_bucket_index = ((time_of_day - time_of_day_histogram_min)
+        .min(time_of_day_histogram_max)
+        / time_of_day_histogram_bucket_size)
+        .min(time_of_day_histogram.len() - 1);
+      time_of_day_histogram[time_of_day_bucket_index] += 1;
+    }
+  }
+
+  Ok(Json(DailyChallengeUserStats {
+    total_participation: scores.len(),
+    total_score_stats: TotalScoreStats {
+      total_score_sum,
+      total_score_rank,
+      total_score_percentile,
+    },
+    score_distribution: Histogram {
+      min: score_histogram_min,
+      max: score_histogram_max,
+      buckets: score_histogram,
+    },
+    time_of_day_distribution: Histogram {
+      min: time_of_day_histogram_min,
+      max: time_of_day_histogram_max,
+      buckets: time_of_day_histogram,
+    },
+    streaks,
+    top_10_percent_count,
+    top_50_percent_count,
+    best_placement_absolute: if best_placement_absolute.rank == 0 {
+      None
+    } else {
+      Some(best_placement_absolute)
+    },
+    best_placement_percentile: if best_placement_percentile.percentile == 100. {
+      None
+    } else {
+      Some(best_placement_percentile)
+    },
+    best_placement_score: if best_placement_score.score == 0 {
+      None
+    } else {
+      Some(best_placement_score)
+    },
+  }))
 }
 
 pub(crate) async fn get_daily_challenge_stats_for_day(
