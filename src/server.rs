@@ -289,6 +289,10 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
         "/daily-challenge/day/:day_id/stats",
         axum::routing::get(daily_challenge::get_daily_challenge_stats_for_day),
       )
+      .route(
+        "/daily-challenge/rankings",
+        axum::routing::get(daily_challenge::get_daily_challenge_rankings),
+      )
   }
 
   router = router
