@@ -5,7 +5,7 @@ use std::{
   sync::Arc,
   time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::{Mutex, OnceCell, RwLock};
 
 use crate::{metrics::http_server, server::APIError};
 
@@ -203,12 +203,11 @@ pub struct ClientInfo {
   client_secret: String,
 }
 
-// Global cache and Mutex
 lazy_static::lazy_static! {
-  static ref TOKEN_CACHE: Arc<Mutex<TokenCache>> = Arc::new(Mutex::new(TokenCache::new()));
+  static ref TOKEN_CACHE: Arc<RwLock<TokenCache>> = Arc::new(RwLock::new(TokenCache::new()));
 
   #[cfg(feature = "daily_challenge")]
-  static ref USER_TOKEN_CACHE: Arc<Mutex<TokenCache>> = Arc::new(Mutex::new(TokenCache::new()));
+  static ref USER_TOKEN_CACHE: Arc<RwLock<TokenCache>> = Arc::new(RwLock::new(TokenCache::new()));
 
   pub static ref REQWEST_CLIENT: Client = Client::new();
 
@@ -229,12 +228,6 @@ async fn get_generic_auth_header<F: Future<Output = Result<OAuthToken, APIError>
   token_cache: &mut TokenCache,
   fetch_access_token: impl Fn() -> F,
 ) -> Result<String, APIError> {
-  if token_cache.is_valid() {
-    if let Some(ref token) = token_cache.token {
-      return Ok(token.build_auth_header());
-    }
-  }
-
   info!("Fetching new OAuth token");
   let now = Instant::now();
   http_server::oauth_refresh_requests_total().inc();
@@ -268,16 +261,28 @@ async fn get_generic_auth_header<F: Future<Output = Result<OAuthToken, APIError>
 }
 
 pub async fn get_auth_header() -> Result<String, APIError> {
-  let cache_lock = TOKEN_CACHE.clone();
-  let mut token_cache = cache_lock.lock().await;
+  let token_cache = TOKEN_CACHE.read().await;
+  if token_cache.is_valid() {
+    if let Some(ref token) = token_cache.token {
+      return Ok(token.build_auth_header());
+    }
+  }
 
+  drop(token_cache);
+  let mut token_cache = TOKEN_CACHE.write().await;
   get_generic_auth_header(&mut token_cache, fetch_access_token).await
 }
 
-#[cfg(feature = "sql")]
+#[cfg(feature = "daily_challenge")]
 pub async fn get_user_auth_header() -> Result<String, APIError> {
-  let cache_lock = TOKEN_CACHE.clone();
-  let mut token_cache = cache_lock.lock().await;
+  let token_cache = USER_TOKEN_CACHE.read().await;
+  if token_cache.is_valid() {
+    if let Some(ref token) = token_cache.token {
+      return Ok(token.build_auth_header());
+    }
+  }
 
+  drop(token_cache);
+  let mut token_cache = USER_TOKEN_CACHE.write().await;
   get_generic_auth_header(&mut token_cache, fetch_user_access_token).await
 }

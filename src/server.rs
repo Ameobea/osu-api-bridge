@@ -1,9 +1,17 @@
-use std::sync::Arc;
+use std::{
+  future::Future,
+  marker::PhantomData,
+  pin::{self, Pin},
+  sync::Arc,
+  task::{Context, Poll},
+};
 
 use arc_swap::ArcSwap;
 use axum::{
-  extract::{Path, Query},
+  extract::{FromRequest, Path, Query, Request},
+  handler::Handler,
   http::StatusCode,
+  middleware::Next,
   response::{IntoResponse, Response},
   Json, Router,
 };
@@ -29,11 +37,7 @@ mod daily_challenge;
 #[cfg(feature = "simulate_play")]
 mod simulate_play;
 
-async fn index() -> &'static str {
-  http_server::requests_total("index").inc();
-  http_server::requests_success_total("index").inc();
-  "osu-api-bridge up and running successfully!"
-}
+async fn index() -> &'static str { "osu-api-bridge up and running successfully!" }
 
 #[derive(Deserialize)]
 struct GetHiscoresParams {
@@ -56,33 +60,18 @@ async fn get_hiscores(
   Path(user_id): Path<u64>,
   Query(params): Query<GetHiscoresParams>,
 ) -> Result<Json<Vec<HiscoreV1>>, APIError> {
-  http_server::requests_total("get_hiscores").inc();
+  let hiscores_v2 = fetch_user_hiscores(user_id, params.mode, params.limit, params.offset).await?;
 
-  let res = async move {
-    let hiscores_v2 =
-      fetch_user_hiscores(user_id, params.mode, params.limit, params.offset).await?;
+  let hiscores_v1 = hiscores_v2
+    .into_iter()
+    .map(|hs| hs.into_v1())
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|err| APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: format!("Error converting hiscores to v1 format: {}", err),
+    })?;
 
-    let hiscores_v1 = hiscores_v2
-      .into_iter()
-      .map(|hs| hs.into_v1())
-      .collect::<Result<Vec<_>, _>>()
-      .map_err(|err| APIError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: format!("Error converting hiscores to v1 format: {}", err),
-      })?;
-
-    Ok(Json(hiscores_v1))
-  };
-  match res.await {
-    Ok(res) => {
-      http_server::requests_success_total("get_hiscores").inc();
-      Ok(res)
-    },
-    Err(err) => {
-      http_server::requests_failed_total("get_hiscores").inc();
-      Err(err)
-    },
-  }
+  Ok(Json(hiscores_v1))
 }
 
 #[derive(Deserialize)]
@@ -94,19 +83,9 @@ async fn get_user_scores_for_beatmap(
   Path((user_id, beatmap_id)): Path<(u64, u64)>,
   Query(params): Query<ModeQueryParam>,
 ) -> Result<Json<Vec<UserScoreOnBeatmap>>, APIError> {
-  let endpoint_name = "get_user_scores_for_beatmap";
-  http_server::requests_total(endpoint_name).inc();
-
-  match crate::osu_api::fetch_all_user_scores_for_beatmap(user_id, beatmap_id, params.mode).await {
-    Ok(hiscores) => {
-      http_server::requests_success_total(endpoint_name).inc();
-      Ok(Json(hiscores))
-    },
-    Err(err) => {
-      http_server::requests_failed_total(endpoint_name).inc();
-      Err(err)
-    },
-  }
+  crate::osu_api::fetch_all_user_scores_for_beatmap(user_id, beatmap_id, params.mode)
+    .await
+    .map(Json)
 }
 
 #[derive(Deserialize)]
@@ -120,20 +99,8 @@ async fn get_user_best_score_for_beatmap(
   Path((user_id, beatmap_id)): Path<(u64, u64)>,
   Query(GetBestScoreParams { mode, mods }): Query<GetBestScoreParams>,
 ) -> Result<Json<Option<UserScoreOnBeatmap>>, APIError> {
-  let endpoint_name = "get_user_best_score_for_beatmap";
-  http_server::requests_total(endpoint_name).inc();
-
   let mut scores =
-    match crate::osu_api::fetch_all_user_scores_for_beatmap(user_id, beatmap_id, mode).await {
-      Ok(hiscores) => {
-        http_server::requests_success_total(endpoint_name).inc();
-        hiscores
-      },
-      Err(err) => {
-        http_server::requests_failed_total(endpoint_name).inc();
-        return Err(err);
-      },
-    };
+    crate::osu_api::fetch_all_user_scores_for_beatmap(user_id, beatmap_id, mode).await?;
 
   // split every two characters
   let required_mods: Vec<String> = match mods {
@@ -180,24 +147,28 @@ async fn get_user_id(
   Path(username): Path<String>,
   Query(params): Query<ModeQueryParam>,
 ) -> Result<Json<u64>, APIError> {
-  let endpoint_name = "get_user_id";
-  http_server::requests_total(endpoint_name).inc();
-  match crate::osu_api::fetch_user_id(&username, params.mode).await {
-    Ok(user_id) => {
-      http_server::requests_success_total(endpoint_name).inc();
-      Ok(Json(user_id))
-    },
-    Err(err) => {
-      http_server::requests_failed_total(endpoint_name).inc();
-      Err(err)
-    },
+  // first check local DB to avoid osu! API roundtrip
+  #[cfg(feature = "sql")]
+  {
+    let mut conn = crate::db::conn().await?;
+    let query = sqlx::query_scalar!("SELECT osu_id FROM users WHERE username = ?", username);
+    match query.fetch_optional(&mut *conn).await {
+      Ok(Some(user_id)) => {
+        return Ok(Json(user_id as u64));
+      },
+      Err(err) => {
+        error!("Error fetching user_id from DB: {err}");
+      },
+      _ => (),
+    }
   }
+
+  crate::osu_api::fetch_user_id(&username, params.mode)
+    .await
+    .map(Json)
 }
 
 async fn get_username(Path(user_id): Path<u64>) -> Result<Json<String>, APIError> {
-  let endpoint_name = "get_username";
-  http_server::requests_total(endpoint_name).inc();
-
   // first check local DB to avoid osu! API roundtrip
   #[cfg(feature = "sql")]
   {
@@ -205,7 +176,6 @@ async fn get_username(Path(user_id): Path<u64>) -> Result<Json<String>, APIError
     let query = sqlx::query_scalar!("SELECT username FROM users WHERE osu_id = ?", user_id);
     match query.fetch_optional(&mut *conn).await {
       Ok(Some(username)) => {
-        http_server::requests_success_total(endpoint_name).inc();
         return Ok(Json(username));
       },
       Err(err) => {
@@ -215,15 +185,71 @@ async fn get_username(Path(user_id): Path<u64>) -> Result<Json<String>, APIError
     }
   }
 
-  match crate::osu_api::fetch_username(user_id).await {
-    Ok(username) => {
-      http_server::requests_success_total(endpoint_name).inc();
-      Ok(Json(username))
-    },
-    Err(err) => {
-      http_server::requests_failed_total(endpoint_name).inc();
-      Err(err)
-    },
+  crate::osu_api::fetch_username(user_id).await.map(Json)
+}
+
+#[derive(Clone)]
+struct InstrumentedHandler<H, S> {
+  pub endpoint_name: &'static str,
+  pub handler: H,
+  pub state: PhantomData<S>,
+}
+
+#[pin_project::pin_project]
+struct InstrumentedHandlerFuture<F> {
+  #[pin]
+  inner: F,
+  endpoint_name: &'static str,
+}
+
+impl<F: Unpin + Future<Output = Response>> Future for InstrumentedHandlerFuture<F> {
+  type Output = Response;
+
+  fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    http_server::requests_total(self.endpoint_name).inc();
+
+    let endpoint_name = self.endpoint_name;
+    let this = self.project();
+    let inner = this.inner;
+    let inner_poll = inner.poll(cx);
+
+    match inner_poll {
+      Poll::Ready(res) => {
+        if res.status().is_success() {
+          http_server::requests_success_total(endpoint_name).inc();
+        } else {
+          http_server::requests_failed_total(endpoint_name).inc();
+        }
+        Poll::Ready(res)
+      },
+      Poll::Pending => Poll::Pending,
+    }
+  }
+}
+
+impl<T, H: Handler<T, S>, S: Clone + Send + 'static> Handler<T, S> for InstrumentedHandler<H, S>
+where
+  H::Future: Unpin,
+{
+  type Future = InstrumentedHandlerFuture<H::Future>;
+
+  fn call(self, req: Request, state: S) -> Self::Future {
+    let res_future = self.handler.call(req, state);
+    InstrumentedHandlerFuture {
+      inner: res_future,
+      endpoint_name: self.endpoint_name,
+    }
+  }
+}
+
+fn instrument_handler<T: 'static, H: Handler<T, S> + 'static, S: Clone + Send + 'static>(
+  endpoint_name: &'static str,
+  handler: H,
+) -> InstrumentedHandler<H, S> {
+  InstrumentedHandler {
+    endpoint_name,
+    handler,
+    state: PhantomData,
   }
 }
 
@@ -240,29 +266,50 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
   crate::db::init_db_pool(&settings.sql.db_url).await?;
 
   let mut router = Router::new()
-    .route("/", axum::routing::get(index))
-    .route("/users/:user_id/hiscores", axum::routing::get(get_hiscores))
+    .route("/", axum::routing::get(instrument_handler("index", index)))
+    .route(
+      "/users/:user_id/hiscores",
+      axum::routing::get(instrument_handler("get_hiscores", get_hiscores)),
+    )
     .route(
       "/users/:user_id/beatmaps/:beatmap_id/scores",
-      axum::routing::get(get_user_scores_for_beatmap),
+      axum::routing::get(instrument_handler(
+        "get_user_scores_for_beatmap",
+        get_user_scores_for_beatmap,
+      )),
     )
     .route(
       "/users/:user_id/beatmaps/:beatmap_id/best",
-      axum::routing::get(get_user_best_score_for_beatmap),
+      axum::routing::get(instrument_handler(
+        "get_user_best_score_for_beatmap",
+        get_user_best_score_for_beatmap,
+      )),
     )
-    .route("/users/:username/id", axum::routing::get(get_user_id))
-    .route("/users/:user_id/username", axum::routing::get(get_username));
+    .route(
+      "/users/:username/id",
+      axum::routing::get(instrument_handler("get_user_id", get_user_id)),
+    )
+    .route(
+      "/users/:user_id/username",
+      axum::routing::get(instrument_handler("get_username", get_username)),
+    );
 
   #[cfg(feature = "simulate_play")]
   {
     router = router
       .route(
         "/beatmaps/:beatmap_id/simulate",
-        axum::routing::get(simulate_play::simulate_play_route),
+        axum::routing::get(instrument_handler(
+          "simulate_play",
+          simulate_play::simulate_play_route,
+        )),
       )
       .route(
         "/beatmaps/:beatmap_id/simulate/batch",
-        axum::routing::post(simulate_play::batch_simulate_play_route),
+        axum::routing::post(instrument_handler(
+          "batch_simulate_play",
+          simulate_play::batch_simulate_play_route,
+        )),
       );
   }
 
@@ -271,27 +318,45 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
     router = router
       .route(
         "/daily-challenge/backfill",
-        axum::routing::post(daily_challenge::backfill_daily_challenges),
+        axum::routing::post(instrument_handler(
+          "backfill_daily_challenge",
+          daily_challenge::backfill_daily_challenges,
+        )),
       )
       .route(
         "/daily-challenge/user/:user_id/history",
-        axum::routing::get(daily_challenge::get_user_daily_challenge_history),
+        axum::routing::get(instrument_handler(
+          "get_user_daily_challenge_history",
+          daily_challenge::get_user_daily_challenge_history,
+        )),
       )
       .route(
         "/daily-challenge/user/:user_id/day/:day_id",
-        axum::routing::get(daily_challenge::get_user_daily_challenge_for_day),
+        axum::routing::get(instrument_handler(
+          "get_user_daily_challenge_for_day",
+          daily_challenge::get_user_daily_challenge_for_day,
+        )),
       )
       .route(
         "/daily-challenge/user/:user_id/stats",
-        axum::routing::get(daily_challenge::get_user_daily_challenge_stats),
+        axum::routing::get(instrument_handler(
+          "get_user_daily_challenge_stats",
+          daily_challenge::get_user_daily_challenge_stats,
+        )),
       )
       .route(
         "/daily-challenge/day/:day_id/stats",
-        axum::routing::get(daily_challenge::get_daily_challenge_stats_for_day),
+        axum::routing::get(instrument_handler(
+          "get_daily_challenge_stats_for_day",
+          daily_challenge::get_daily_challenge_stats_for_day,
+        )),
       )
       .route(
         "/daily-challenge/rankings",
-        axum::routing::get(daily_challenge::get_daily_challenge_rankings),
+        axum::routing::get(instrument_handler(
+          "get_daily_challenge_rankings",
+          daily_challenge::get_daily_challenge_rankings,
+        )),
       )
   }
 

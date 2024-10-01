@@ -18,6 +18,7 @@ use crate::{
 use super::*;
 
 async fn store_daily_challenge_metadata(
+  txn: &mut sqlx::Transaction<'_, MySql>,
   metadata: &[NewDailyChallengeDescriptor],
 ) -> sqlx::Result<()> {
   if metadata.is_empty() {
@@ -50,8 +51,7 @@ async fn store_daily_challenge_metadata(
   );
   let query = qb.build();
 
-  let pool = db_pool();
-  pool.execute(query).await?;
+  txn.execute(query).await?;
   Ok(())
 }
 
@@ -199,7 +199,7 @@ pub(super) async fn backfill_daily_challenges(
       .collect();
 
   all_daily_challenge_ids.retain(|ids| !already_collected_day_ids.contains(&ids.day_id));
-  store_daily_challenge_metadata(&all_daily_challenge_ids)
+  store_daily_challenge_metadata(&mut txn, &all_daily_challenge_ids)
     .await
     .map_err(|err| {
       error!("Failed to store daily challenge metadata in DB: {err}");
@@ -245,24 +245,29 @@ pub(super) async fn backfill_daily_challenges(
     }
   })?;
 
-  if let Some(stats_store) = DAILY_CHALLENGE_STATS.get() {
-    tokio::spawn(async move {
-      info!("Refreshing daily challenge stats cache...");
+  tokio::spawn(async move {
+    info!("Refreshing daily challenge stats cache...");
+    if let Some(stats_store) = DAILY_CHALLENGE_STATS.get() {
       match load_daily_challenge_stats().await {
         Ok(new_stats) => {
           stats_store.store(Arc::new(new_stats));
-          info!("Refreshed daily challenge stats cache");
+          info!("Successfully refreshed daily challenge stats cache");
         },
         Err(err) => {
           error!("Failed to refresh daily challenge stats cache: {err}");
         },
       }
-    });
-  }
+    } else {
+      match get_daily_challenge_stats().await {
+        Ok(_) => info!("Successfully refreshed daily challenge stats cache"),
+        Err(err) => error!("Failed to refresh daily challenge stats cache: {err:?}"),
+      }
+    }
+  });
 
-  if let Some(rankings_store) = USER_TOTAL_SCORE_RANKINGS.get() {
-    tokio::spawn(async move {
-      info!("Refreshing user total score rankings cache...");
+  tokio::spawn(async move {
+    info!("Refreshing user total score rankings cache...");
+    if let Some(rankings_store) = USER_TOTAL_SCORE_RANKINGS.get() {
       match load_user_total_score_rankings(fetch_missing_usernames.unwrap_or(true)).await {
         Ok(new_rankings) => {
           rankings_store.store(Arc::new(new_rankings));
@@ -272,8 +277,13 @@ pub(super) async fn backfill_daily_challenges(
           error!("Failed to refresh user total score rankings cache: {err:?}");
         },
       }
-    });
-  }
+    } else {
+      match get_user_total_score_rankings(fetch_missing_usernames.unwrap_or(true)).await {
+        Ok(_) => info!("Refreshed user total score rankings cache"),
+        Err(err) => error!("Failed to refresh user total score rankings cache: {err:?}"),
+      }
+    }
+  });
 
   Ok(())
 }
@@ -1010,13 +1020,11 @@ pub(crate) struct GetDailyChallengeRankingsResponse {
 
 pub(crate) async fn get_daily_challenge_rankings(
   Query(LoadUserTotalScoreRankingsQueryParams {
-    fetch_missing_usernames,
     page,
+    fetch_missing_usernames: _,
   }): Query<LoadUserTotalScoreRankingsQueryParams>,
 ) -> Result<Json<GetDailyChallengeRankingsResponse>, APIError> {
-  let rankings = get_user_total_score_rankings(fetch_missing_usernames.unwrap_or(true))
-    .await?
-    .load();
+  let rankings = get_user_total_score_rankings(false).await?.load();
   let page_size = 50;
   let start = page.unwrap_or(1).max(1) * page_size - page_size;
   let end = start + page_size;

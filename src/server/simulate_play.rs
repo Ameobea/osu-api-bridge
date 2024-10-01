@@ -111,23 +111,11 @@ pub(super) async fn simulate_play_route(
   Path(beatmap_id): Path<u64>,
   Query(params): Query<SimulatePlayQueryParams>,
 ) -> Result<Json<SimulatePlayResponse>, APIError> {
-  let endpoint_name = "simulate_play";
-  http_server::requests_total(endpoint_name).inc();
-  let pp_res = try {
-    let beatmap = download_beatmap(beatmap_id).await?;
-    let diff_attrs = compute_diff_attrs(&beatmap, params.mods.as_deref().unwrap_or_default())?;
-    simulate_play(diff_attrs, &params).await?
-  };
-  match pp_res {
-    Ok(pp) => {
-      http_server::requests_success_total(endpoint_name).inc();
-      Ok(Json(SimulatePlayResponse { pp }))
-    },
-    Err(err) => {
-      http_server::requests_failed_total(endpoint_name).inc();
-      Err(err)
-    },
-  }
+  let beatmap = download_beatmap(beatmap_id).await?;
+  let diff_attrs = compute_diff_attrs(&beatmap, params.mods.as_deref().unwrap_or_default())?;
+  simulate_play(diff_attrs, &params)
+    .await
+    .map(|pp| Json(SimulatePlayResponse { pp }))
 }
 
 #[derive(Deserialize)]
@@ -144,41 +132,28 @@ pub(super) struct BatchSimulatePlayResponse {
 pub(super) async fn batch_simulate_play_route(
   body: String,
 ) -> Result<Json<BatchSimulatePlayResponse>, APIError> {
-  let endpoint_name = "batch_simulate_play";
-  let pps_res = try {
-    let BatchSimulatePlayParams { beatmap_id, params } =
-      serde_json::from_str(&body).map_err(|err| APIError {
-        status: StatusCode::BAD_REQUEST,
-        message: format!("Error parsing request body: {err}"),
-      })?;
+  let BatchSimulatePlayParams { beatmap_id, params } =
+    serde_json::from_str(&body).map_err(|err| APIError {
+      status: StatusCode::BAD_REQUEST,
+      message: format!("Error parsing request body: {err}"),
+    })?;
 
-    let beatmap = download_beatmap(beatmap_id).await?;
-    let Some(first_params) = params.first() else {
-      return Ok(Json(BatchSimulatePlayResponse { pp: Vec::new() }));
-    };
-    let mut last_mods = first_params.mods.clone();
-    let mut diff_attrs = compute_diff_attrs(&beatmap, last_mods.as_deref().unwrap_or_default())?;
-    let mut pps = Vec::new();
-    for params in params {
-      if params.mods != last_mods {
-        last_mods = params.mods.clone();
-        diff_attrs = compute_diff_attrs(&beatmap, last_mods.as_deref().unwrap_or_default())?;
-      }
-
-      let pp = simulate_play(diff_attrs.clone(), &params).await?;
-      pps.push(pp);
+  let beatmap = download_beatmap(beatmap_id).await?;
+  let Some(first_params) = params.first() else {
+    return Ok(Json(BatchSimulatePlayResponse { pp: Vec::new() }));
+  };
+  let mut last_mods = first_params.mods.clone();
+  let mut diff_attrs = compute_diff_attrs(&beatmap, last_mods.as_deref().unwrap_or_default())?;
+  let mut pps = Vec::new();
+  for params in params {
+    if params.mods != last_mods {
+      last_mods = params.mods.clone();
+      diff_attrs = compute_diff_attrs(&beatmap, last_mods.as_deref().unwrap_or_default())?;
     }
 
-    pps
-  };
-  match pps_res {
-    Ok(pps) => {
-      http_server::requests_success_total(endpoint_name).inc();
-      Ok(Json(BatchSimulatePlayResponse { pp: pps }))
-    },
-    Err(err) => {
-      http_server::requests_failed_total(endpoint_name).inc();
-      Err(err)
-    },
+    let pp = simulate_play(diff_attrs.clone(), &params).await?;
+    pps.push(pp);
   }
+
+  Ok(Json(BatchSimulatePlayResponse { pp: pps }))
 }

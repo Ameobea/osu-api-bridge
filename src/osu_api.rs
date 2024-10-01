@@ -206,7 +206,7 @@ pub struct Beatmapset {
 
 #[derive(Serialize, Deserialize)]
 pub struct Beatmap {
-  pub beatmapset_id: i64,
+  pub beatmapset_id: Option<i64>,
   pub difficulty_rating: f32,
   pub id: i64,
   pub mode: String,
@@ -214,7 +214,7 @@ pub struct Beatmap {
   pub total_length: i64,
   pub user_id: i64,
   pub version: String,
-  pub beatmapset: Beatmapset,
+  pub beatmapset: Option<Beatmapset>,
 }
 
 #[derive(Deserialize)]
@@ -288,6 +288,8 @@ async fn make_osu_api_request_inner(
   method: Method,
   auth_header: String,
 ) -> Result<String, APIError> {
+  http_server::osu_api_requests_total(endpoint_name).inc();
+
   let now = Instant::now();
   let res = REQWEST_CLIENT
     .request(method, url)
@@ -352,8 +354,6 @@ pub async fn fetch_user_hiscores(
   limit: Option<u8>,
   offset: Option<u8>,
 ) -> Result<GetHiscoresV2Response, APIError> {
-  http_server::osu_api_requests_total("fetch_user_hiscores").inc();
-
   let limit = limit.unwrap_or(100);
   let offset = offset.unwrap_or(0);
 
@@ -448,7 +448,7 @@ pub mod daily_challenge {
   use reqwest::StatusCode;
   use serde::{Deserialize, Serialize};
 
-  use crate::server::APIError;
+  use crate::{metrics::http_server, server::APIError};
 
   use super::Beatmap;
 
