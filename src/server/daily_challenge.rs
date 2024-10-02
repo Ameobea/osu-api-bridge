@@ -879,10 +879,7 @@ pub(crate) async fn get_user_daily_challenge_history(
   };
 
   let scores = res.map_err(|err| {
-    error!(
-      "Failed to load daily challenge stats from DB for user {}: {err}",
-      user_id
-    );
+    error!("Failed to load daily challenge stats from DB for user {user_id}: {err}",);
     APIError {
       status: StatusCode::INTERNAL_SERVER_ERROR,
       message: "Failed to load daily challenge stats from DB".to_owned(),
@@ -1105,11 +1102,14 @@ pub(crate) async fn get_user_daily_challenge_stats(
     }
   })?;
 
-  if scores.is_empty() {
-    return Ok(Json(DailyChallengeUserStats::default()));
-  }
-
   let stats = get_daily_challenge_stats().await?.load();
+
+  if scores.is_empty() {
+    return Ok(Json(DailyChallengeUserStats {
+      total_challenge_count: stats.len(),
+      ..Default::default()
+    }));
+  }
 
   let mut total_score_sum = 0;
   let (total_score_rank, total_score_percentile) = {
