@@ -1,17 +1,16 @@
 use std::{
   future::Future,
   marker::PhantomData,
-  pin::{self, Pin},
+  pin::Pin,
   sync::Arc,
   task::{Context, Poll},
 };
 
 use arc_swap::ArcSwap;
 use axum::{
-  extract::{FromRequest, Path, Query, Request},
+  extract::{Path, Query, Request},
   handler::Handler,
   http::StatusCode,
-  middleware::Next,
   response::{IntoResponse, Response},
   Json, Router,
 };
@@ -150,9 +149,8 @@ async fn get_user_id(
   // first check local DB to avoid osu! API roundtrip
   #[cfg(feature = "sql")]
   {
-    let mut conn = crate::db::conn().await?;
     let query = sqlx::query_scalar!("SELECT osu_id FROM users WHERE username = ?", username);
-    match query.fetch_optional(&mut *conn).await {
+    match query.fetch_optional(crate::db::db_pool()).await {
       Ok(Some(user_id)) => {
         return Ok(Json(user_id as u64));
       },
@@ -172,9 +170,8 @@ async fn get_username(Path(user_id): Path<u64>) -> Result<Json<String>, APIError
   // first check local DB to avoid osu! API roundtrip
   #[cfg(feature = "sql")]
   {
-    let mut conn = crate::db::conn().await?;
     let query = sqlx::query_scalar!("SELECT username FROM users WHERE osu_id = ?", user_id);
-    match query.fetch_optional(&mut *conn).await {
+    match query.fetch_optional(crate::db::db_pool()).await {
       Ok(Some(username)) => {
         return Ok(Json(username));
       },
@@ -356,6 +353,20 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
         axum::routing::get(instrument_handler(
           "get_daily_challenge_rankings",
           daily_challenge::get_daily_challenge_rankings,
+        )),
+      )
+      .route(
+        "/daily-challenge/global-stats",
+        axum::routing::get(instrument_handler(
+          "get_daily_challenge_global_stats",
+          daily_challenge::get_daily_challenge_global_stats,
+        )),
+      )
+      .route(
+        "/daily-challenge/latest-day-id",
+        axum::routing::get(instrument_handler(
+          "get_latest_daily_challenge_day_id",
+          daily_challenge::get_latest_daily_challenge_day_id,
         )),
       )
   }

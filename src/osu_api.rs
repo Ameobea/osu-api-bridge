@@ -448,7 +448,7 @@ pub mod daily_challenge {
   use reqwest::StatusCode;
   use serde::{Deserialize, Serialize};
 
-  use crate::{metrics::http_server, server::APIError};
+  use crate::server::APIError;
 
   use super::Beatmap;
 

@@ -5,7 +5,7 @@ use std::{
   sync::Arc,
   time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, OnceCell, RwLock};
+use tokio::sync::{OnceCell, RwLock};
 
 use crate::{metrics::http_server, server::APIError};
 

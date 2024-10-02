@@ -3,7 +3,7 @@ use std::cmp::Reverse;
 use chrono::{DateTime, Datelike, Days, NaiveDate, Timelike, Utc, Weekday};
 use fxhash::{FxHashMap, FxHashSet};
 use serde::Serialize;
-use sqlx::{mysql::MySqlRow, Acquire, Executor, MySql, QueryBuilder};
+use sqlx::{mysql::MySqlRow, Executor, MySql, QueryBuilder, Row};
 use tokio::sync::OnceCell;
 
 use crate::{
@@ -162,24 +162,23 @@ pub(super) async fn backfill_daily_challenges(
     if admin_api_token.is_empty() {
       return Err(APIError {
         status: StatusCode::BAD_REQUEST,
-        message: "Missing admin API token in request body".to_string(),
+        message: "Missing admin API token in request body".to_owned(),
       });
     }
     return Err(APIError {
       status: StatusCode::UNAUTHORIZED,
-      message: "Invalid admin API token in request body".to_string(),
+      message: "Invalid admin API token in request body".to_owned(),
     });
   }
 
   let mut all_daily_challenge_ids =
     osu_api::daily_challenge::get_daily_challenge_descriptors(false).await?;
 
-  let mut conn = conn().await?;
-  let mut txn = conn.begin().await.map_err(|err| {
+  let mut txn = db_pool().begin().await.map_err(|err| {
     error!("Failed to start transaction for daily challenge backfill: {err}");
     APIError {
       status: StatusCode::INTERNAL_SERVER_ERROR,
-      message: "Failed to start transaction for daily challenge backfill".to_string(),
+      message: "Failed to start transaction for daily challenge backfill".to_owned(),
     }
   })?;
 
@@ -191,7 +190,7 @@ pub(super) async fn backfill_daily_challenges(
         error!("Failed to fetch already collected daily challenge IDs from DB: {err}");
         APIError {
           status: StatusCode::INTERNAL_SERVER_ERROR,
-          message: "Failed to fetch already collected daily challenge IDs from DB".to_string(),
+          message: "Failed to fetch already collected daily challenge IDs from DB".to_owned(),
         }
       })?
       .into_iter()
@@ -205,7 +204,7 @@ pub(super) async fn backfill_daily_challenges(
       error!("Failed to store daily challenge metadata in DB: {err}");
       APIError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: "Failed to store daily challenge metadata in DB".to_string(),
+        message: "Failed to store daily challenge metadata in DB".to_owned(),
       }
     })?;
 
@@ -241,7 +240,7 @@ pub(super) async fn backfill_daily_challenges(
     error!("Failed to commit transaction for daily challenge backfill: {err}");
     APIError {
       status: StatusCode::INTERNAL_SERVER_ERROR,
-      message: "Failed to commit transaction for daily challenge backfill".to_string(),
+      message: "Failed to commit transaction for daily challenge backfill".to_owned(),
     }
   })?;
 
@@ -343,11 +342,15 @@ async fn load_daily_challenge_stats() -> sqlx::Result<FxHashMap<usize, DailyChal
           buckets[bucket.min(bucket_count - 1)] += 1;
         }
 
-        Histogram { min, max, buckets }
+        Histogram {
+          min: min as f32,
+          max: max as f32,
+          buckets,
+        }
       })
       .unwrap_or_else(|| Histogram {
-        min: 0,
-        max: 1_000_000,
+        min: 0.,
+        max: 1_000_000.,
         buckets: vec![0, 0, 0],
       });
 
@@ -361,57 +364,324 @@ async fn load_daily_challenge_stats() -> sqlx::Result<FxHashMap<usize, DailyChal
   Ok(stats)
 }
 
-async fn build_rankings(
-  user_ids: &[usize],
-  fetch_missing_usernames: bool,
-) -> Result<Vec<DailyChallengeRankingEntry>, APIError> {
-  let mut conn = conn().await?;
+#[derive(Clone, Serialize)]
+pub(crate) struct TopMapperEntry {
+  pub user_id: usize,
+  pub username: String,
+  pub map_ids: Vec<usize>,
+}
 
+#[derive(Clone, Serialize)]
+pub(crate) struct MapStats {
+  pub difficulty_distribution: Histogram,
+  pub length_distribution_seconds: Histogram,
+  pub ranked_timestamp_distribution: Histogram,
+  pub ar_distribution: Histogram,
+  pub od_distribution: Histogram,
+  pub cs_distribution: Histogram,
+  pub top_mappers: Vec<TopMapperEntry>,
+  // TODO: most popular required mods
+}
+
+#[derive(Clone, Serialize)]
+pub(crate) struct GlobalDailyChallengeStats {
+  /// Total unique users who have participated in daily challenges
+  pub total_unique_participants: usize,
+  /// Total combined score of all users on all days
+  pub total_combined_score: usize,
+  /// Total number of rankings across all days
+  pub total_rankings: usize,
+  /// Total number of daily challenges
+  pub total_challenges: usize,
+  pub map_stats: MapStats,
+}
+
+fn build_histogram(
+  data: Vec<f32>,
+  bucket_count: usize,
+  explicit_min: Option<f32>,
+  explicit_max: Option<f32>,
+) -> Histogram {
+  let (computed_min, computed_max) = data
+    .iter()
+    .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), &val| {
+      (min.min(val), max.max(val))
+    });
+  let min = explicit_min.unwrap_or(computed_min);
+  let max = explicit_max.unwrap_or(computed_max);
+  let bucket_size = (max - min) / bucket_count as f32;
+
+  let mut buckets = vec![0; bucket_count];
+  for val in data {
+    let bucket = ((val - min) / bucket_size) as usize;
+    buckets[bucket.min(bucket_count - 1)] += 1;
+  }
+
+  Histogram { min, max, buckets }
+}
+
+async fn get_map_stats() -> Result<MapStats, APIError> {
+  // TODO: need to check for missing beatmap metadata
+  let mut conn = conn().await?;
+  let query = sqlx::query!(
+    r#"
+    SELECT
+      CAST(JSON_EXTRACT(current_playlist_item, '$.beatmap.id') AS UNSIGNED) AS beatmap_id,
+      CAST(JSON_EXTRACT(current_playlist_item, '$.beatmap.difficulty_rating') AS FLOAT) AS stars,
+      CAST(JSON_EXTRACT(current_playlist_item, '$.beatmap.user_id') AS UNSIGNED) AS mapper_user_id,
+      beatmaps.total_length AS length_seconds,
+      beatmaps.diff_size AS cs,
+      beatmaps.diff_approach AS ar,
+      beatmaps.diff_overall AS od,
+      beatmaps.approved_date AS date_ranked
+    FROM daily_challenge_metadata
+      INNER JOIN beatmaps ON beatmaps.beatmap_id=JSON_EXTRACT(current_playlist_item, '$.beatmap.id')
+    "#,
+  );
+  let rows = query.fetch_all(&mut *conn).await.map_err(|err| {
+    error!("Failed to fetch daily challenge metadata from DB: {err}");
+    APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: "Failed to fetch daily challenge metadata from DB".to_owned(),
+    }
+  })?;
+
+  let mut difficulties = Vec::with_capacity(rows.len());
+  let mut ranked_timestamps = Vec::with_capacity(rows.len());
+  let mut lengths_seconds = Vec::with_capacity(rows.len());
+  let mut ars = Vec::with_capacity(rows.len());
+  let mut ods = Vec::with_capacity(rows.len());
+  let mut css = Vec::with_capacity(rows.len());
+  let mut top_mappers = FxHashMap::default();
+
+  for row in rows {
+    let Some(beatmap_id) = row.beatmap_id else {
+      error!("Missing beatmap ID for daily challenge metadata row");
+      continue;
+    };
+
+    if let Some(stars) = row.stars {
+      difficulties.push(stars);
+    } else {
+      warn!("Missing difficulty rating for beatmap {beatmap_id}");
+    }
+
+    if let Some(date_ranked) = row.date_ranked {
+      ranked_timestamps.push(date_ranked.and_utc().timestamp() as f32);
+    } else {
+      warn!("Missing ranked date for beatmap {beatmap_id}");
+    }
+
+    if let Some(mapper_user_id) = row.mapper_user_id {
+      top_mappers
+        .entry(mapper_user_id as usize)
+        .or_insert_with(|| TopMapperEntry {
+          user_id: mapper_user_id as usize,
+          username: "Unknown".to_owned(),
+          map_ids: Vec::new(),
+        })
+        .map_ids
+        .push(beatmap_id as usize);
+    } else {
+      warn!("Missing mapper user ID for beatmap {beatmap_id}");
+    }
+
+    lengths_seconds.push(row.length_seconds as f32);
+    ars.push(row.ar as f32);
+    ods.push(row.od as f32);
+    css.push(row.cs as f32);
+  }
+
+  let difficulty_distribution = build_histogram(difficulties, 20, None, None);
+  let length_distribution_seconds = build_histogram(lengths_seconds, 20, None, None);
+  let ranked_timestamp_distribution = build_histogram(ranked_timestamps, 20, None, None);
+  let ar_distribution = build_histogram(ars, 11, Some(0.), Some(11.));
+  let od_distribution = build_histogram(ods, 11, Some(0.), Some(11.));
+  let cs_distribution = build_histogram(css, 10, Some(0.), Some(10.));
+
+  let mut top_mappers: Vec<_> = top_mappers.into_values().collect();
+  top_mappers.sort_unstable_by_key(|entry| Reverse(entry.map_ids.len()));
+  top_mappers.retain(|entry| entry.map_ids.len() > 1);
+  let count_at_ix_5 = top_mappers.get(5).map(|entry| entry.map_ids.len());
+  let count_at_ix_20 = top_mappers.get(20).map(|entry| entry.map_ids.len());
+
+  match (count_at_ix_5, count_at_ix_20) {
+    (None, None) => (),
+    (Some(count_at_ix_5), Some(count_at_ix_20)) =>
+      if count_at_ix_5 != count_at_ix_20 {
+        top_mappers.retain(|entry| entry.map_ids.len() >= count_at_ix_5);
+      } else if top_mappers[0].map_ids.len() > count_at_ix_5 {
+        top_mappers.retain(|entry| entry.map_ids.len() > count_at_ix_5);
+      },
+    (Some(count_at_ix_5), None) => {
+      top_mappers.retain(|entry| entry.map_ids.len() >= count_at_ix_5);
+    },
+    _ => top_mappers.truncate(5),
+  }
+
+  // fetch usernames for top mappers
+  let user_ids: Vec<usize> = top_mappers.iter().map(|entry| entry.user_id).collect();
+  let (all_user_ids, missing_user_ids, _existing_user_ids) =
+    get_existing_user_ids(&user_ids).await.map_err(|err| {
+      error!("Failed to fetch existing user IDs from DB: {err}");
+      APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: "Failed to fetch existing user IDs from DB".to_owned(),
+      }
+    })?;
+
+  populate_missing_usernames(missing_user_ids.iter().copied(), all_user_ids.len()).await;
+
+  let mut qb = QueryBuilder::new("SELECT osu_id, username FROM users WHERE osu_id IN ");
+  qb.push_tuples(user_ids.iter(), |mut b, &osu_id| {
+    b.push_bind(osu_id as i64);
+  });
+  let query = qb.build();
+
+  let res: Vec<MySqlRow> = query.fetch_all(&mut *conn).await.map_err(|err| {
+    error!("Failed to fetch usernames for top mappers from DB: {err}");
+    APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: "Failed to fetch usernames for top mappers from DB".to_owned(),
+    }
+  })?;
+  let username_by_user_id: FxHashMap<usize, String> = res
+    .into_iter()
+    .map(|row| (row.get::<i64, _>(0) as usize, row.get(1)))
+    .collect();
+
+  for entry in &mut top_mappers {
+    entry.username = username_by_user_id
+      .get(&entry.user_id)
+      .cloned()
+      .unwrap_or_else(|| {
+        warn!(
+          "Missing username for user {} even trying to populate missing usernames",
+          entry.user_id
+        );
+        "Unknown".to_owned()
+      });
+  }
+
+  Ok(MapStats {
+    difficulty_distribution,
+    length_distribution_seconds,
+    ranked_timestamp_distribution,
+    ar_distribution,
+    od_distribution,
+    cs_distribution,
+    top_mappers,
+  })
+}
+
+async fn load_global_daily_challenge_stats() -> Result<GlobalDailyChallengeStats, APIError> {
+  let mut conn = conn().await?;
+  let (total_combined_score, total_rankings, total_unique_participants, total_challenges) =
+    sqlx::query!(
+      r#"
+      SELECT CAST(SUM(total_score) as UNSIGNED) AS total_combined_score, COUNT(*) AS total_rankings, COUNT(DISTINCT user_id) AS total_unique_participants, COUNT(DISTINCT day_id) AS total_challenges
+      FROM daily_challenge_rankings
+      "#,
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|err| {
+      error!("Failed to fetch global daily challenge stats from DB: {err}");
+      APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: "Failed to fetch global daily challenge stats from DB".to_owned(),
+      }
+    })
+    .map(|row| {
+      (
+        row.total_combined_score.unwrap_or(0) as usize,
+        row.total_rankings as usize,
+        row.total_unique_participants as usize,
+        row.total_challenges as usize,
+      )
+    })?;
+
+  let map_stats = get_map_stats().await?;
+
+  Ok(GlobalDailyChallengeStats {
+    total_combined_score,
+    total_rankings,
+    total_unique_participants,
+    total_challenges,
+    map_stats,
+  })
+}
+
+async fn get_existing_user_ids(
+  user_ids: &[usize],
+) -> sqlx::Result<(FxHashSet<usize>, Vec<usize>, FxHashSet<usize>)> {
   let mut qb = QueryBuilder::new("SELECT osu_id FROM users WHERE osu_id IN ");
   qb.push_tuples(user_ids, |mut b, &osu_id| {
     b.push_bind(osu_id as i64);
   });
   let query = qb.build();
 
-  let res: Vec<MySqlRow> = query.fetch_all(&mut *conn).await.map_err(|err| {
-    error!("Failed to fetch existing user IDs from DB: {err}");
-    APIError {
-      status: StatusCode::INTERNAL_SERVER_ERROR,
-      message: "Failed to fetch existing user IDs from DB".to_string(),
-    }
-  })?;
+  let res: Vec<MySqlRow> = query.fetch_all(db_pool()).await?;
   let all_user_ids: FxHashSet<usize> = user_ids.iter().copied().collect();
   let existing_user_ids: FxHashSet<usize> = res
     .into_iter()
     .map(|row| sqlx::Row::get::<i64, _>(&row, 0usize) as usize)
     .collect();
+  let missing_user_ids: Vec<usize> = all_user_ids
+    .difference(&existing_user_ids)
+    .copied()
+    .collect();
+
+  Ok((all_user_ids, missing_user_ids, existing_user_ids))
+}
+
+async fn populate_missing_usernames(
+  missing_user_ids: impl ExactSizeIterator<Item = usize>,
+  total_user_ids: usize,
+) {
+  if missing_user_ids.len() == 0 {
+    return;
+  }
+
+  info!(
+    "Missing {}/{total_user_ids} usernames; fetching...",
+    missing_user_ids.len(),
+  );
+
+  let client = reqwest::Client::new();
+  for id in missing_user_ids {
+    let url = format!("https://osutrack-api.ameo.dev/update?user={id}&mode=0");
+    let req = client.post(&url).send().await;
+    match req {
+      Ok(res) =>
+        if res.status().is_success() {
+          info!("Successfully updated user {id}");
+        } else {
+          error!("Failed to update user {id}: {}", res.status());
+        },
+      Err(err) => error!("Failed to update user {id}: {err}"),
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+  }
+}
+
+async fn build_rankings(
+  user_ids: &[usize],
+  fetch_missing_usernames: bool,
+) -> Result<Vec<DailyChallengeRankingEntry>, APIError> {
+  let mut conn = conn().await?;
+
+  let (all_user_ids, missing_user_ids, _existing_user_ids) =
+    get_existing_user_ids(user_ids).await.map_err(|err| {
+      error!("Failed to fetch existing user IDs from DB: {err}");
+      APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: "Failed to fetch existing user IDs from DB".to_owned(),
+      }
+    })?;
 
   if fetch_missing_usernames {
-    let missing_user_ids: Vec<usize> = all_user_ids
-      .difference(&existing_user_ids)
-      .copied()
-      .collect();
-    info!(
-      "Missing {}/{} usernames; fetching...",
-      missing_user_ids.len(),
-      user_ids.len()
-    );
-
-    let client = reqwest::Client::new();
-    for id in missing_user_ids {
-      let url = format!("https://osutrack-api.ameo.dev/update?user={id}&mode=0");
-      let req = client.post(&url).send().await;
-      match req {
-        Ok(res) =>
-          if res.status().is_success() {
-            info!("Successfully updated user {id}");
-          } else {
-            error!("Failed to update user {id}: {}", res.status());
-          },
-        Err(err) => error!("Failed to update user {id}: {err}"),
-      }
-      tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
+    populate_missing_usernames(missing_user_ids.iter().copied(), all_user_ids.len()).await;
   }
 
   let rankings_query = sqlx::query!(
@@ -431,7 +701,7 @@ async fn build_rankings(
     error!("Failed to fetch daily challenge rankings from DB: {err}");
     APIError {
       status: StatusCode::INTERNAL_SERVER_ERROR,
-      message: "Failed to fetch daily challenge rankings from DB".to_string(),
+      message: "Failed to fetch daily challenge rankings from DB".to_owned(),
     }
   })?;
 
@@ -440,7 +710,7 @@ async fn build_rankings(
     .enumerate()
     .map(|(rank, row)| DailyChallengeRankingEntry {
       user_id: row.user_id as usize,
-      username: row.username.unwrap_or_else(|| "Unknown".to_string()),
+      username: row.username.unwrap_or_else(|| "Unknown".to_owned()),
       rank: rank + 1,
       total_score: row.total_score.unwrap_or(0) as usize,
     })
@@ -457,16 +727,14 @@ pub(crate) struct LoadUserTotalScoreRankingsQueryParams {
 async fn load_user_total_score_rankings(
   fetch_missing_usernames: bool,
 ) -> Result<UserTotalScoreRankings, APIError> {
-  let mut conn = conn().await?;
-
   let query = sqlx::query_scalar!(
     "SELECT user_id FROM daily_challenge_rankings GROUP BY user_id ORDER BY SUM(total_score) DESC"
   );
-  let rows = query.fetch_all(&mut *conn).await.map_err(|err| {
+  let rows = query.fetch_all(db_pool()).await.map_err(|err| {
     error!("Failed to load user total score rankings from DB: {err}");
     APIError {
       status: StatusCode::INTERNAL_SERVER_ERROR,
-      message: "Failed to load user total score rankings from DB".to_string(),
+      message: "Failed to load user total score rankings from DB".to_owned(),
     }
   })?;
 
@@ -488,8 +756,8 @@ async fn load_user_total_score_rankings(
 
 #[derive(Clone, Default, Serialize)]
 pub(crate) struct Histogram {
-  min: usize,
-  max: usize,
+  min: f32,
+  max: f32,
   buckets: Vec<usize>,
 }
 
@@ -516,6 +784,8 @@ pub(crate) struct UserTotalScoreRankings {
 static DAILY_CHALLENGE_STATS: OnceCell<ArcSwap<FxHashMap<usize, DailyChallengeStatsForDay>>> =
   OnceCell::const_new();
 static USER_TOTAL_SCORE_RANKINGS: OnceCell<ArcSwap<UserTotalScoreRankings>> = OnceCell::const_new();
+static GLOBAL_DAILY_CHALLENGE_STATS: OnceCell<ArcSwap<GlobalDailyChallengeStats>> =
+  OnceCell::const_new();
 
 async fn get_daily_challenge_stats(
 ) -> Result<&'static ArcSwap<FxHashMap<usize, DailyChallengeStatsForDay>>, APIError> {
@@ -526,7 +796,7 @@ async fn get_daily_challenge_stats(
         error!("Failed to load daily challenge stats from DB: {err}");
         APIError {
           status: StatusCode::INTERNAL_SERVER_ERROR,
-          message: "Failed to load daily challenge stats from DB".to_string(),
+          message: "Failed to load daily challenge stats from DB".to_owned(),
         }
       })?;
       info!("Fetched {} daily challenge stats from DB", stats.len());
@@ -551,6 +821,18 @@ async fn get_user_total_score_rankings(
     .await
 }
 
+async fn get_global_daily_challenge_stats(
+) -> Result<&'static ArcSwap<GlobalDailyChallengeStats>, APIError> {
+  GLOBAL_DAILY_CHALLENGE_STATS
+    .get_or_try_init(|| async {
+      info!("Fetching global daily challenge stats from DB...");
+      let stats = load_global_daily_challenge_stats().await?;
+      info!("Fetched global daily challenge stats from DB");
+      Ok(ArcSwap::new(Arc::new(stats)))
+    })
+    .await
+}
+
 #[derive(Deserialize)]
 pub(crate) struct DailyChallengeHistoryQueryParams {
   start_day_id: Option<usize>,
@@ -571,8 +853,6 @@ pub(crate) async fn get_user_daily_challenge_history(
     end_day_id,
   }): Query<DailyChallengeHistoryQueryParams>,
 ) -> Result<Json<Vec<UserDailyChallengeHistoryEntry>>, APIError> {
-  let mut conn = conn().await?;
-
   let res: Result<Vec<UserDailyChallengeScore>, _> = match (start_day_id, end_day_id) {
     (None, None) => {
       let query = sqlx::query_as!(
@@ -582,7 +862,7 @@ pub(crate) async fn get_user_daily_challenge_history(
          user_id = ? ORDER BY day_id ASC",
         user_id as i64
       );
-      query.fetch_all(&mut *conn).await
+      query.fetch_all(db_pool()).await
     },
     (start, end) => {
       let query = sqlx::query_as!(
@@ -594,7 +874,7 @@ pub(crate) async fn get_user_daily_challenge_history(
         start.unwrap_or(0) as i64,
         end.unwrap_or(99999999) as i64
       );
-      query.fetch_all(&mut *conn).await
+      query.fetch_all(db_pool()).await
     },
   };
 
@@ -605,7 +885,7 @@ pub(crate) async fn get_user_daily_challenge_history(
     );
     APIError {
       status: StatusCode::INTERNAL_SERVER_ERROR,
-      message: "Failed to load daily challenge stats from DB".to_string(),
+      message: "Failed to load daily challenge stats from DB".to_owned(),
     }
   })?;
 
@@ -636,15 +916,6 @@ pub(crate) async fn get_user_daily_challenge_history(
 pub(crate) async fn get_user_daily_challenge_for_day(
   Path((user_id, day_id)): Path<(usize, usize)>,
 ) -> Result<Json<Option<UserDailyChallengeScore>>, APIError> {
-  let pool = db_pool();
-  let mut conn = pool.acquire().await.map_err(|err| {
-    error!("Failed to acquire DB connection for daily challenge stats: {err}");
-    APIError {
-      status: StatusCode::INTERNAL_SERVER_ERROR,
-      message: "Failed to acquire DB connection for daily challenge stats".to_string(),
-    }
-  })?;
-
   let query = sqlx::query_as!(
     UserDailyChallengeScore,
     "SELECT day_id, user_id, score_id, pp, rank, statistics, total_score, started_at, ended_at, \
@@ -653,14 +924,14 @@ pub(crate) async fn get_user_daily_challenge_for_day(
     user_id as i64,
     day_id as i64
   );
-  let score = query.fetch_optional(&mut *conn).await.map_err(|err| {
+  let score = query.fetch_optional(db_pool()).await.map_err(|err| {
     error!(
       "Failed to load daily challenge stats from DB for user {} on day {}: {err}",
       user_id, day_id
     );
     APIError {
       status: StatusCode::INTERNAL_SERVER_ERROR,
-      message: "Failed to load daily challenge stats from DB".to_string(),
+      message: "Failed to load daily challenge stats from DB".to_owned(),
     }
   })?;
 
@@ -815,15 +1086,13 @@ fn compute_streaks(
 pub(crate) async fn get_user_daily_challenge_stats(
   Path(user_id): Path<usize>,
 ) -> Result<Json<DailyChallengeUserStats>, APIError> {
-  let mut conn = conn().await?;
-
   let scores = sqlx::query_as!(
     MinimalUserDailyChallengeScore,
     "SELECT day_id, user_rank, total_score, ended_at, mods FROM daily_challenge_rankings WHERE \
      user_id = ? ORDER BY day_id ASC",
     user_id as i64
   )
-  .fetch_all(&mut *conn)
+  .fetch_all(db_pool())
   .await
   .map_err(|err| {
     error!(
@@ -832,7 +1101,7 @@ pub(crate) async fn get_user_daily_challenge_stats(
     );
     APIError {
       status: StatusCode::INTERNAL_SERVER_ERROR,
-      message: "Failed to load daily challenge stats from DB".to_string(),
+      message: "Failed to load daily challenge stats from DB".to_owned(),
     }
   })?;
 
@@ -968,13 +1237,13 @@ pub(crate) async fn get_user_daily_challenge_stats(
       total_score_percentile,
     },
     score_distribution: Histogram {
-      min: score_histogram_min,
-      max: score_histogram_max,
+      min: score_histogram_min as f32,
+      max: score_histogram_max as f32,
       buckets: score_histogram,
     },
     time_of_day_distribution: Histogram {
-      min: time_of_day_histogram_min,
-      max: time_of_day_histogram_max,
+      min: time_of_day_histogram_min as f32,
+      max: time_of_day_histogram_max as f32,
       buckets: time_of_day_histogram,
     },
     streaks,
@@ -1006,7 +1275,7 @@ pub(crate) async fn get_daily_challenge_stats_for_day(
     error!("No stats found for daily challenge {}", day_id);
     APIError {
       status: StatusCode::NOT_FOUND,
-      message: "No stats found for daily challenge".to_string(),
+      message: "No stats found for daily challenge".to_owned(),
     }
   })?;
   Ok(Json(stats.clone()))
@@ -1036,4 +1305,26 @@ pub(crate) async fn get_daily_challenge_rankings(
     rankings: page_rankings.to_owned(),
     total_rankings: rankings.rankings.len(),
   }))
+}
+
+pub(crate) async fn get_daily_challenge_global_stats(
+) -> Result<Json<GlobalDailyChallengeStats>, APIError> {
+  let stats = get_global_daily_challenge_stats().await?.load();
+  Ok(Json((**stats).clone()))
+}
+
+pub(crate) async fn get_latest_daily_challenge_day_id() -> Result<Json<usize>, APIError> {
+  let query = sqlx::query_scalar!("SELECT MAX(day_id) FROM daily_challenge_metadata");
+  let day_id = query
+    .fetch_one(db_pool())
+    .await
+    .map_err(|err| {
+      error!("Failed to fetch latest daily challenge day ID from DB: {err}");
+      APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: "Failed to fetch latest daily challenge day ID from DB".to_owned(),
+      }
+    })?
+    .expect("looks like the database has been emptied");
+  Ok(Json(day_id as usize))
 }
