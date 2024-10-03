@@ -11,6 +11,7 @@ use crate::{
   osu_api::{
     self,
     daily_challenge::{DailyChallengeScore, NewDailyChallengeDescriptor},
+    Mod,
   },
   util::serialize_json_bytes_opt,
 };
@@ -380,7 +381,7 @@ pub(crate) struct MapStats {
   pub od_distribution: Histogram,
   pub cs_distribution: Histogram,
   pub top_mappers: Vec<TopMapperEntry>,
-  // TODO: most popular required mods
+  pub top_required_mods: Vec<(Vec<Mod>, usize)>,
 }
 
 #[derive(Clone, Serialize)]
@@ -426,9 +427,11 @@ async fn get_map_stats() -> Result<MapStats, APIError> {
   let query = sqlx::query!(
     r#"
     SELECT
+      day_id,
       CAST(JSON_EXTRACT(current_playlist_item, '$.beatmap.id') AS UNSIGNED) AS beatmap_id,
       CAST(JSON_EXTRACT(current_playlist_item, '$.beatmap.difficulty_rating') AS FLOAT) AS stars,
       CAST(JSON_EXTRACT(current_playlist_item, '$.beatmap.user_id') AS UNSIGNED) AS mapper_user_id,
+      JSON_EXTRACT(current_playlist_item, '$.required_mods') AS required_mods,
       beatmaps.total_length AS length_seconds,
       beatmaps.diff_size AS cs,
       beatmaps.diff_approach AS ar,
@@ -453,6 +456,7 @@ async fn get_map_stats() -> Result<MapStats, APIError> {
   let mut ods = Vec::with_capacity(rows.len());
   let mut css = Vec::with_capacity(rows.len());
   let mut top_mappers = FxHashMap::default();
+  let mut top_required_mods = FxHashMap::default();
 
   for row in rows {
     let Some(beatmap_id) = row.beatmap_id else {
@@ -490,6 +494,20 @@ async fn get_map_stats() -> Result<MapStats, APIError> {
     ars.push(row.ar as f32);
     ods.push(row.od as f32);
     css.push(row.cs as f32);
+
+    let required_mods: Vec<Mod> = match row.required_mods {
+      Some(required_mods) => serde_json::from_slice(&required_mods).unwrap_or_else(|err| {
+        warn!("Failed to parse required mods for beatmap {beatmap_id}: {err}");
+        Vec::new()
+      }),
+      None => Vec::new(),
+    };
+    let day_id = row.day_id as usize;
+    let entry = top_required_mods
+      .entry(required_mods)
+      .or_insert((0usize, day_id));
+    entry.0 += 1;
+    entry.1 = entry.1.max(day_id);
   }
 
   let difficulty_distribution = build_histogram(difficulties, 20, None, None);
@@ -563,6 +581,15 @@ async fn get_map_stats() -> Result<MapStats, APIError> {
       });
   }
 
+  let mut top_required_mods: Vec<_> = top_required_mods.into_iter().collect();
+  top_required_mods.sort_unstable_by_key(|(_, (count, most_recent_day_id))| {
+    Reverse((*count, *most_recent_day_id))
+  });
+  let top_required_mods = top_required_mods
+    .into_iter()
+    .map(|(mods, (count, _))| (mods, count))
+    .collect();
+
   Ok(MapStats {
     difficulty_distribution,
     length_distribution_seconds,
@@ -571,6 +598,7 @@ async fn get_map_stats() -> Result<MapStats, APIError> {
     od_distribution,
     cs_distribution,
     top_mappers,
+    top_required_mods,
   })
 }
 
@@ -977,6 +1005,7 @@ pub(crate) struct DailyChallengeUserStats {
   pub best_placement_absolute: Option<BestPlacement>,
   pub best_placement_percentile: Option<BestPlacement>,
   pub best_placement_score: Option<BestPlacement>,
+  pub most_used_mods: Vec<(Option<Mod>, usize)>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1163,6 +1192,7 @@ pub(crate) async fn get_user_daily_challenge_stats(
 
   let last_daily_challenge_day_id = stats.keys().max().copied().unwrap();
   let streaks = compute_streaks(&scores, last_daily_challenge_day_id);
+  let mut most_used_mods = FxHashMap::default();
 
   for score in &scores {
     total_score_sum += score.total_score as usize;
@@ -1226,7 +1256,44 @@ pub(crate) async fn get_user_daily_challenge_stats(
         .min(time_of_day_histogram.len() - 1);
       time_of_day_histogram[time_of_day_bucket_index] += 1;
     }
+
+    match &score.mods {
+      Some(mods) => match serde_json::from_slice::<Vec<Mod>>(mods) {
+        Ok(mods) if mods.is_empty() => {
+          most_used_mods
+            .entry(None)
+            .or_insert((0, score.day_id as usize))
+            .0 += 1;
+        },
+        Ok(mods) =>
+          for m in mods {
+            let entry = most_used_mods
+              .entry(Some(m))
+              .or_insert((0, score.day_id as usize));
+            entry.0 += 1;
+            entry.1 = entry.1.max(score.day_id as usize);
+          },
+        Err(_) => {
+          error!(
+            "Failed to parse mods for daily challenge score for user={user_id} day_id={}; found: \
+             {}",
+            score.day_id,
+            String::from_utf8_lossy(mods)
+          );
+        },
+      },
+      None => (),
+    }
   }
+
+  let mut most_used_mods: Vec<_> = most_used_mods.into_iter().collect();
+  most_used_mods.sort_unstable_by_key(|(_, (count, most_recent_day_id))| {
+    Reverse((*count, *most_recent_day_id))
+  });
+  let most_used_mods = most_used_mods
+    .into_iter()
+    .map(|(m, (count, _))| (m, count))
+    .collect();
 
   Ok(Json(DailyChallengeUserStats {
     total_participation: scores.len(),
@@ -1264,6 +1331,7 @@ pub(crate) async fn get_user_daily_challenge_stats(
     } else {
       Some(best_placement_score)
     },
+    most_used_mods,
   }))
 }
 

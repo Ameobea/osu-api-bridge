@@ -147,7 +147,7 @@ impl HiscoreV2 {
   }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct Mod {
   pub acronym: String,
   pub settings: Option<serde_json::Map<String, serde_json::Value>>,
