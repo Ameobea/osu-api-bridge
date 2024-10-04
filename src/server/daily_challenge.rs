@@ -737,10 +737,10 @@ async fn build_rankings(
     .into_iter()
     .enumerate()
     .map(|(rank, row)| DailyChallengeRankingEntry {
-      user_id: row.user_id as usize,
+      user_id: row.user_id as u64,
       username: row.username.unwrap_or_else(|| "Unknown".to_owned()),
-      rank: rank + 1,
-      total_score: row.total_score.unwrap_or(0) as usize,
+      rank: rank as u64 + 1,
+      total_score: row.total_score.unwrap_or(0),
     })
     .collect();
   Ok(rankings)
@@ -796,12 +796,12 @@ pub struct DailyChallengeStatsForDay {
   pub histogram: Histogram,
 }
 
-#[derive(Clone, Serialize, sqlx::FromRow)]
+#[derive(Clone, Serialize)]
 pub(crate) struct DailyChallengeRankingEntry {
-  user_id: usize,
+  user_id: u64,
   username: String,
-  rank: usize,
-  total_score: usize,
+  rank: u64,
+  total_score: u64,
 }
 
 pub(crate) struct UserTotalScoreRankings {
@@ -1347,6 +1347,52 @@ pub(crate) async fn get_daily_challenge_stats_for_day(
     }
   })?;
   Ok(Json(stats.clone()))
+}
+
+pub(crate) async fn get_daily_challenge_rankings_for_day(
+  Path(day_id): Path<usize>,
+  Query(LoadUserTotalScoreRankingsQueryParams {
+    page,
+    fetch_missing_usernames: _,
+  }): Query<LoadUserTotalScoreRankingsQueryParams>,
+) -> Result<Json<Vec<DailyChallengeRankingEntry>>, APIError> {
+  let page_size = 50;
+  let start = (page.unwrap_or(1).max(1) - 1) * page_size;
+  let query = sqlx::query!(
+    r#"
+    SELECT
+      CAST(user_id as UNSIGNED) AS user_id,
+      IFNULL(username, 'Unknown') as username,
+      CAST(total_score as UNSIGNED) AS total_score
+    FROM daily_challenge_rankings
+    LEFT JOIN users
+      ON users.osu_id = daily_challenge_rankings.user_id
+    WHERE day_id = ?
+    ORDER BY total_score DESC
+    LIMIT ?, ?
+    "#,
+    day_id as i64,
+    start as i64,
+    page_size as i64
+  );
+  let rankings = query.fetch_all(db_pool()).await.map_err(|err| {
+    error!("Failed to load daily challenge rankings from DB for day {day_id}: {err}");
+    APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: "Failed to load daily challenge rankings from DB".to_owned(),
+    }
+  })?;
+  let rankings: Vec<DailyChallengeRankingEntry> = rankings
+    .into_iter()
+    .enumerate()
+    .map(|(i, row)| DailyChallengeRankingEntry {
+      user_id: row.user_id,
+      username: row.username,
+      rank: start as u64 + i as u64 + 1,
+      total_score: row.total_score,
+    })
+    .collect();
+  Ok(Json(rankings))
 }
 
 #[derive(Serialize)]

@@ -349,6 +349,13 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
         )),
       )
       .route(
+        "/daily-challenge/day/:day_id/rankings",
+        axum::routing::get(instrument_handler(
+          "get_daily_challenge_rankings_for_day",
+          daily_challenge::get_daily_challenge_rankings_for_day,
+        )),
+      )
+      .route(
         "/daily-challenge/rankings",
         axum::routing::get(instrument_handler(
           "get_daily_challenge_rankings",
