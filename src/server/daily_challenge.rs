@@ -285,6 +285,26 @@ pub(super) async fn backfill_daily_challenges(
     }
   });
 
+  tokio::spawn(async move {
+    info!("Refreshing global daily challenge stats cache...");
+    if let Some(global_stats) = GLOBAL_DAILY_CHALLENGE_STATS.get() {
+      match load_global_daily_challenge_stats().await {
+        Ok(new_stats) => {
+          global_stats.store(Arc::new(new_stats));
+          info!("Refreshed global daily challenge stats cache");
+        },
+        Err(err) => {
+          error!("Failed to refresh global daily challenge stats cache: {err:?}");
+        },
+      }
+    } else {
+      match get_global_daily_challenge_stats().await {
+        Ok(_) => info!("Refreshed global daily challenge stats cache"),
+        Err(err) => error!("Failed to refresh global daily challenge stats cache: {err:?}"),
+      }
+    }
+  });
+
   Ok(())
 }
 
