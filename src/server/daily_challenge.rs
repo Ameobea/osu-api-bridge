@@ -69,7 +69,7 @@ async fn store_daily_challenge_metadata(
 //   max_combo INT NOT NULL,
 //   accuracy FLOAT NOT NULL
 // );
-#[derive(Serialize, sqlx::FromRow)]
+#[derive(Clone, Serialize)]
 pub(crate) struct UserDailyChallengeScore {
   day_id: i64,
   user_id: i64,
@@ -393,15 +393,42 @@ pub(crate) struct TopMapperEntry {
 }
 
 #[derive(Clone, Serialize)]
+pub(crate) struct MinimalDailyChallengeDescriptor {
+  pub day_id: usize,
+  pub beatmap_id: u64,
+  pub title: String,
+  pub difficulty_name: String,
+  pub mapper_user_id: u64,
+  pub mapper_username: String,
+  pub stars: f32,
+  pub date_ranked: DateTime<Utc>,
+  pub length_seconds: usize,
+}
+
+#[derive(Clone, Serialize)]
+pub(crate) struct TopPPPlay {
+  username: String,
+  score: UserDailyChallengeScore,
+  total_scores_for_day: usize,
+}
+
+#[derive(Clone, Serialize)]
 pub(crate) struct MapStats {
   pub difficulty_distribution: Histogram,
+  pub easiest_map: Option<MinimalDailyChallengeDescriptor>,
+  pub hardest_map: Option<MinimalDailyChallengeDescriptor>,
   pub length_distribution_seconds: Histogram,
+  pub shortest_map: Option<MinimalDailyChallengeDescriptor>,
+  pub longest_map: Option<MinimalDailyChallengeDescriptor>,
   pub ranked_timestamp_distribution: Histogram,
+  pub oldest_map: Option<MinimalDailyChallengeDescriptor>,
+  pub newest_map: Option<MinimalDailyChallengeDescriptor>,
   pub ar_distribution: Histogram,
   pub od_distribution: Histogram,
   pub cs_distribution: Histogram,
   pub top_mappers: Vec<TopMapperEntry>,
   pub top_required_mods: Vec<(Vec<Mod>, usize)>,
+  pub top_pp_plays: Vec<TopPPPlay>,
 }
 
 #[derive(Clone, Serialize)]
@@ -441,8 +468,94 @@ fn build_histogram(
   Histogram { min, max, buckets }
 }
 
+struct MinMaxMapContainer<T: Clone, V: Copy + PartialOrd, F: Fn(&T) -> Option<V>> {
+  min: Option<V>,
+  max: Option<V>,
+  min_value: Option<T>,
+  max_value: Option<T>,
+  get_value: F,
+}
+
+impl<T: Clone, V: Copy + PartialOrd, F: Fn(&T) -> Option<V>> MinMaxMapContainer<T, V, F> {
+  fn new(get_value: F) -> Self {
+    Self {
+      min: None,
+      max: None,
+      min_value: None,
+      max_value: None,
+      get_value,
+    }
+  }
+
+  fn insert(&mut self, map: T) {
+    let Some(value) = (self.get_value)(&map) else {
+      return;
+    };
+
+    if self.min.as_ref().map_or(true, |min| value < *min) {
+      self.min = Some(value);
+      self.min_value = Some(map.clone());
+    }
+    if self.max.as_ref().map_or(true, |max| value > *max) {
+      self.max = Some(value);
+      self.max_value = Some(map);
+    }
+  }
+
+  fn into_inner(self) -> (Option<T>, Option<T>) { (self.min_value, self.max_value) }
+}
+
 async fn get_map_stats() -> Result<MapStats, APIError> {
-  // TODO: need to check for missing beatmap metadata
+  // check for missing beatmap metadata
+  let missing_beatmap_ids = sqlx::query_scalar!(
+    "SELECT
+      DISTINCT CAST(JSON_EXTRACT(current_playlist_item, '$.beatmap.id') AS UNSIGNED)
+    FROM daily_challenge_metadata
+      INNER JOIN beatmaps
+        ON beatmaps.beatmap_id=CAST(JSON_EXTRACT(current_playlist_item, '$.beatmap.id') AS \
+     UNSIGNED)
+    WHERE beatmaps.title IS NULL"
+  )
+  .fetch_all(db_pool())
+  .await
+  .map_err(|err| {
+    error!("Failed to fetch missing beatmap IDs from DB: {err}");
+    APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: "Failed to fetch missing beatmap IDs from DB".to_owned(),
+    }
+  })?;
+  let missing_beatmap_ids = missing_beatmap_ids
+    .into_iter()
+    .filter_map(|id| id)
+    .collect::<Vec<_>>();
+  if !missing_beatmap_ids.is_empty() {
+    warn!(
+      "Found {} missing beatmap IDs in daily challenge metadata",
+      missing_beatmap_ids.len()
+    );
+
+    let client = reqwest::Client::new();
+    for id in missing_beatmap_ids {
+      info!("Fetching beatmap id={id}...");
+      match client
+        .get(&format!(
+          "https://ameobea.me/osutrack/getBeatmap.php?id={id}"
+        ))
+        .send()
+        .await
+      {
+        Ok(res) =>
+          if res.status().is_success() {
+            info!("Successfully fetched beatmap id={id}");
+          } else {
+            error!("Failed to fetch beatmap id={id}: {}", res.status());
+          },
+        Err(err) => error!("Failed to fetch beatmap id={id}: {err}"),
+      }
+    }
+  }
+
   let mut conn = conn().await?;
   let query = sqlx::query!(
     r#"
@@ -456,9 +569,13 @@ async fn get_map_stats() -> Result<MapStats, APIError> {
       beatmaps.diff_size AS cs,
       beatmaps.diff_approach AS ar,
       beatmaps.diff_overall AS od,
-      beatmaps.approved_date AS date_ranked
+      beatmaps.approved_date AS date_ranked,
+      beatmaps.title AS title,
+      beatmaps.version AS difficulty_name,
+      users.username AS mapper_username
     FROM daily_challenge_metadata
       INNER JOIN beatmaps ON beatmaps.beatmap_id=JSON_EXTRACT(current_playlist_item, '$.beatmap.id')
+      LEFT JOIN users ON users.osu_id=CAST(JSON_EXTRACT(current_playlist_item, '$.beatmap.user_id') AS UNSIGNED)
     "#,
   );
   let rows = query.fetch_all(&mut *conn).await.map_err(|err| {
@@ -478,37 +595,46 @@ async fn get_map_stats() -> Result<MapStats, APIError> {
   let mut top_mappers = FxHashMap::default();
   let mut top_required_mods = FxHashMap::default();
 
+  let mut min_max_difficulties =
+    MinMaxMapContainer::new(|row: &Arc<MinimalDailyChallengeDescriptor>| Some(row.stars));
+  let mut min_max_lengths_seconds =
+    MinMaxMapContainer::new(|row: &Arc<MinimalDailyChallengeDescriptor>| Some(row.length_seconds));
+  let mut min_max_ranked_timestamps =
+    MinMaxMapContainer::new(|row: &Arc<MinimalDailyChallengeDescriptor>| {
+      Some(row.date_ranked.timestamp())
+    });
+
   for row in rows {
     let Some(beatmap_id) = row.beatmap_id else {
       error!("Missing beatmap ID for daily challenge metadata row");
       continue;
     };
 
-    if let Some(stars) = row.stars {
-      difficulties.push(stars);
-    } else {
-      warn!("Missing difficulty rating for beatmap {beatmap_id}");
-    }
+    let Some(stars) = row.stars else {
+      error!("Missing difficulty rating for beatmap {beatmap_id}");
+      continue;
+    };
+    difficulties.push(stars);
 
-    if let Some(date_ranked) = row.date_ranked {
-      ranked_timestamps.push(date_ranked.and_utc().timestamp() as f32);
-    } else {
-      warn!("Missing ranked date for beatmap {beatmap_id}");
-    }
+    let Some(date_ranked) = row.date_ranked else {
+      error!("Missing ranked date for beatmap {beatmap_id}");
+      continue;
+    };
+    ranked_timestamps.push(date_ranked.and_utc().timestamp() as f32);
 
-    if let Some(mapper_user_id) = row.mapper_user_id {
-      top_mappers
-        .entry(mapper_user_id as usize)
-        .or_insert_with(|| TopMapperEntry {
-          user_id: mapper_user_id as usize,
-          username: "Unknown".to_owned(),
-          map_ids: Vec::new(),
-        })
-        .map_ids
-        .push(beatmap_id as usize);
-    } else {
-      warn!("Missing mapper user ID for beatmap {beatmap_id}");
-    }
+    let Some(mapper_user_id) = row.mapper_user_id else {
+      error!("Missing mapper user ID for beatmap {beatmap_id}");
+      continue;
+    };
+    top_mappers
+      .entry(mapper_user_id as usize)
+      .or_insert_with(|| TopMapperEntry {
+        user_id: mapper_user_id as usize,
+        username: "Unknown".to_owned(),
+        map_ids: Vec::new(),
+      })
+      .map_ids
+      .push(beatmap_id as usize);
 
     lengths_seconds.push(row.length_seconds as f32);
     ars.push(row.ar as f32);
@@ -528,6 +654,22 @@ async fn get_map_stats() -> Result<MapStats, APIError> {
       .or_insert((0usize, day_id));
     entry.0 += 1;
     entry.1 = entry.1.max(day_id);
+
+    let minimal_desc = Arc::new(MinimalDailyChallengeDescriptor {
+      day_id,
+      beatmap_id,
+      title: row.title,
+      difficulty_name: row.difficulty_name,
+      mapper_user_id,
+      mapper_username: row.mapper_username.unwrap_or_else(|| "Unknown".to_owned()),
+      stars,
+      date_ranked: date_ranked.and_utc(),
+      length_seconds: row.length_seconds as usize,
+    });
+
+    min_max_difficulties.insert(Arc::clone(&minimal_desc));
+    min_max_lengths_seconds.insert(Arc::clone(&minimal_desc));
+    min_max_ranked_timestamps.insert(minimal_desc);
   }
 
   let difficulty_distribution = build_histogram(difficulties, 20, None, None);
@@ -610,6 +752,69 @@ async fn get_map_stats() -> Result<MapStats, APIError> {
     .map(|(mods, (count, _))| (mods, count))
     .collect();
 
+  let (easiest_map, hardest_map) = min_max_difficulties.into_inner();
+  let (shortest_map, longest_map) = min_max_lengths_seconds.into_inner();
+  let (oldest_map, newest_map) = min_max_ranked_timestamps.into_inner();
+
+  let top_pp_plays: Vec<UserDailyChallengeScore> = sqlx::query_as!(
+    UserDailyChallengeScore,
+    "SELECT day_id, user_id, score_id, pp, rank, statistics, total_score, started_at, ended_at, \
+     mods, max_combo, accuracy, user_rank FROM daily_challenge_rankings ORDER BY pp DESC LIMIT 10"
+  )
+  .fetch_all(db_pool())
+  .await
+  .map_err(|err| {
+    error!("Failed to fetch top PP plays from DB: {err}");
+    APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: "Failed to fetch top PP plays from DB".to_owned(),
+    }
+  })?;
+
+  // fetch usernames in a separate query because I don't want to create a new struct
+  let user_ids: Vec<usize> = top_pp_plays
+    .iter()
+    .map(|score| score.user_id as usize)
+    .collect();
+  let mut qb = QueryBuilder::new("SELECT osu_id, username FROM users WHERE osu_id IN ");
+  qb.push_tuples(user_ids.iter(), |mut b, &osu_id| {
+    b.push_bind(osu_id as i64);
+  });
+  let query = qb.build();
+  let top_pp_usernames_res: Vec<MySqlRow> = query.fetch_all(&mut *conn).await.map_err(|err| {
+    error!("Failed to fetch usernames for top PP plays from DB: {err}");
+    APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: "Failed to fetch usernames for top PP plays from DB".to_owned(),
+    }
+  })?;
+  let username_by_user_id: FxHashMap<usize, String> = top_pp_usernames_res
+    .into_iter()
+    .map(|row| (row.get::<i64, _>(0) as usize, row.get(1)))
+    .collect();
+
+  let counts_by_day = get_daily_challenge_stats().await?.load();
+  let top_pp_plays = top_pp_plays
+    .into_iter()
+    .map(|score| {
+      let total_scores_for_day = counts_by_day
+        .get(&(score.day_id as usize))
+        .map(|stats| stats.total_scores)
+        .unwrap_or(0);
+      TopPPPlay {
+        username: username_by_user_id
+          .get(&(score.user_id as usize))
+          .cloned()
+          .unwrap_or_else(|| {
+            warn!("Missing username for user {}", score.user_id);
+            "Unknown".to_owned()
+          }),
+        score,
+        total_scores_for_day,
+      }
+    })
+    .collect();
+
   Ok(MapStats {
     difficulty_distribution,
     length_distribution_seconds,
@@ -619,6 +824,13 @@ async fn get_map_stats() -> Result<MapStats, APIError> {
     cs_distribution,
     top_mappers,
     top_required_mods,
+    easiest_map: easiest_map.map(|desc| (*desc).clone()),
+    hardest_map: hardest_map.map(|desc| (*desc).clone()),
+    shortest_map: shortest_map.map(|desc| (*desc).clone()),
+    longest_map: longest_map.map(|desc| (*desc).clone()),
+    oldest_map: oldest_map.map(|desc| (*desc).clone()),
+    newest_map: newest_map.map(|desc| (*desc).clone()),
+    top_pp_plays,
   })
 }
 
@@ -996,6 +1208,7 @@ pub(crate) struct BestPlacement {
   day_id: usize,
   score: usize,
   rank: usize,
+  pp: Option<f32>,
   total_rankings: usize,
   percentile: f32,
 }
@@ -1025,6 +1238,7 @@ pub(crate) struct DailyChallengeUserStats {
   pub best_placement_absolute: Option<BestPlacement>,
   pub best_placement_percentile: Option<BestPlacement>,
   pub best_placement_score: Option<BestPlacement>,
+  pub best_placement_pp: Option<BestPlacement>,
   pub most_used_mods: Vec<(Option<Mod>, usize)>,
 }
 
@@ -1035,6 +1249,7 @@ struct MinimalUserDailyChallengeScore {
   total_score: i64,
   ended_at: Option<DateTime<Utc>>,
   mods: Option<Vec<u8>>,
+  pp: Option<f32>,
 }
 
 fn day_id_to_naive_date(day_id: usize) -> NaiveDate {
@@ -1134,8 +1349,8 @@ pub(crate) async fn get_user_daily_challenge_stats(
 ) -> Result<Json<DailyChallengeUserStats>, APIError> {
   let scores = sqlx::query_as!(
     MinimalUserDailyChallengeScore,
-    "SELECT day_id, user_rank, total_score, ended_at, mods FROM daily_challenge_rankings WHERE \
-     user_id = ? ORDER BY day_id ASC",
+    "SELECT day_id, user_rank, total_score, ended_at, mods, pp FROM daily_challenge_rankings \
+     WHERE user_id = ? ORDER BY day_id ASC",
     user_id as i64
   )
   .fetch_all(db_pool())
@@ -1175,6 +1390,7 @@ pub(crate) async fn get_user_daily_challenge_stats(
   let mut best_placement_absolute: BestPlacement = BestPlacement::default();
   let mut best_placement_percentile: BestPlacement = BestPlacement::default();
   let mut best_placement_score: BestPlacement = BestPlacement::default();
+  let mut best_placement_pp: BestPlacement = BestPlacement::default();
 
   let score_histogram_bucket_count = if scores.len() < 10 {
     10
@@ -1231,13 +1447,16 @@ pub(crate) async fn get_user_daily_challenge_stats(
       top_50_percent_count += 1;
     }
 
-    if best_placement_absolute.rank == 0 || percentile < best_placement_absolute.percentile {
+    if best_placement_absolute.rank == 0
+      || (score.user_rank as usize) < best_placement_absolute.rank
+    {
       best_placement_absolute = BestPlacement {
         day_id: score.day_id as usize,
         score: score.total_score as usize,
         rank: score.user_rank as usize,
         total_rankings,
         percentile,
+        pp: score.pp,
       };
     }
 
@@ -1248,6 +1467,7 @@ pub(crate) async fn get_user_daily_challenge_stats(
         rank: score.user_rank as usize,
         total_rankings,
         percentile,
+        pp: score.pp,
       };
     }
 
@@ -1259,6 +1479,20 @@ pub(crate) async fn get_user_daily_challenge_stats(
         rank: score.user_rank as usize,
         total_rankings,
         percentile,
+        pp: score.pp,
+      };
+    }
+
+    if (best_placement_pp.pp.is_none() && score.pp.is_some())
+      || (score.pp.is_some() && score.pp.unwrap() > best_placement_pp.pp.unwrap_or(0.))
+    {
+      best_placement_pp = BestPlacement {
+        day_id: score.day_id as usize,
+        score: score.total_score as usize,
+        rank: score.user_rank as usize,
+        total_rankings,
+        percentile,
+        pp: score.pp,
       };
     }
 
@@ -1341,7 +1575,7 @@ pub(crate) async fn get_user_daily_challenge_stats(
     } else {
       Some(best_placement_absolute)
     },
-    best_placement_percentile: if best_placement_percentile.percentile == 100. {
+    best_placement_percentile: if best_placement_percentile.rank == 0 {
       None
     } else {
       Some(best_placement_percentile)
@@ -1350,6 +1584,11 @@ pub(crate) async fn get_user_daily_challenge_stats(
       None
     } else {
       Some(best_placement_score)
+    },
+    best_placement_pp: if best_placement_pp.pp.is_none() {
+      None
+    } else {
+      Some(best_placement_pp)
     },
     most_used_mods,
   }))

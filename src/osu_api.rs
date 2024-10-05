@@ -413,7 +413,7 @@ pub async fn fetch_user_id(username: &str, mode: Ruleset) -> Result<u64, APIErro
   match serde_path_to_error::deserialize::<_, User>(deserializer) {
     Ok(user) => Ok(user.id),
     Err(err) => {
-      error!("Failed to parse user response; res: {res_text}; err: {err}");
+      error!("Failed to parse get user ID response; res: {res_text}; err: {err}");
       http_server::osu_api_requests_failed_total(endpoint_name, 200).inc();
       Err(APIError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
