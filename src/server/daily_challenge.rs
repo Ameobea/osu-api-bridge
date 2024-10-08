@@ -759,7 +759,7 @@ async fn get_map_stats() -> Result<MapStats, APIError> {
   let top_pp_plays: Vec<UserDailyChallengeScore> = sqlx::query_as!(
     UserDailyChallengeScore,
     "SELECT day_id, user_id, score_id, pp, rank, statistics, total_score, started_at, ended_at, \
-     mods, max_combo, accuracy, user_rank FROM daily_challenge_rankings ORDER BY pp DESC LIMIT 10"
+     mods, max_combo, accuracy, user_rank FROM daily_challenge_rankings ORDER BY pp DESC LIMIT 20"
   )
   .fetch_all(db_pool())
   .await
