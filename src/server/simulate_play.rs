@@ -44,6 +44,7 @@ async fn download_beatmap(beatmap_id: u64) -> Result<Beatmap, APIError> {
 fn compute_diff_attrs(
   beatmap: &Beatmap,
   mod_string: &str,
+  is_classic: bool,
 ) -> Result<DifficultyAttributes, APIError> {
   let mods = GameModsLegacy::from_str(mod_string).map_err(|err| APIError {
     status: StatusCode::BAD_REQUEST,
@@ -52,6 +53,7 @@ fn compute_diff_attrs(
   Ok(
     rosu_pp::Difficulty::new()
       .mods(mods.bits())
+      .lazer(!is_classic)
       .calculate(&beatmap),
   )
 }
@@ -68,7 +70,10 @@ async fn simulate_play(
       }
     })?;
 
-  let mut perf = Performance::new(diff_attrs).mods(mods.bits());
+  let is_classic = params.is_classic.unwrap_or(true);
+  let mut perf = Performance::new(diff_attrs)
+    .mods(mods.bits())
+    .lazer(!is_classic);
   if let Some(acc) = params.acc {
     perf = perf.accuracy(acc);
   }
@@ -94,6 +99,7 @@ async fn simulate_play(
 #[derive(Deserialize)]
 pub(super) struct SimulatePlayQueryParams {
   mods: Option<String>,
+  is_classic: Option<bool>,
   max_combo: Option<u32>,
   acc: Option<f64>,
   misses: Option<u32>,
@@ -112,7 +118,12 @@ pub(super) async fn simulate_play_route(
   Query(params): Query<SimulatePlayQueryParams>,
 ) -> Result<Json<SimulatePlayResponse>, APIError> {
   let beatmap = download_beatmap(beatmap_id).await?;
-  let diff_attrs = compute_diff_attrs(&beatmap, params.mods.as_deref().unwrap_or_default())?;
+  let is_classic = params.is_classic.unwrap_or(true);
+  let diff_attrs = compute_diff_attrs(
+    &beatmap,
+    params.mods.as_deref().unwrap_or_default(),
+    is_classic,
+  )?;
   simulate_play(diff_attrs, &params)
     .await
     .map(|pp| Json(SimulatePlayResponse { pp }))
@@ -143,12 +154,22 @@ pub(super) async fn batch_simulate_play_route(
     return Ok(Json(BatchSimulatePlayResponse { pp: Vec::new() }));
   };
   let mut last_mods = first_params.mods.clone();
-  let mut diff_attrs = compute_diff_attrs(&beatmap, last_mods.as_deref().unwrap_or_default())?;
+  let is_classic = first_params.is_classic.unwrap_or(true);
+  let mut diff_attrs = compute_diff_attrs(
+    &beatmap,
+    last_mods.as_deref().unwrap_or_default(),
+    is_classic,
+  )?;
   let mut pps = Vec::new();
   for params in params {
     if params.mods != last_mods {
       last_mods = params.mods.clone();
-      diff_attrs = compute_diff_attrs(&beatmap, last_mods.as_deref().unwrap_or_default())?;
+      let is_classic = params.is_classic.unwrap_or(true);
+      diff_attrs = compute_diff_attrs(
+        &beatmap,
+        last_mods.as_deref().unwrap_or_default(),
+        is_classic,
+      )?;
     }
 
     let pp = simulate_play(diff_attrs.clone(), &params).await?;

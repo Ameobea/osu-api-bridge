@@ -224,7 +224,8 @@ impl<F: Unpin + Future<Output = Response>> Future for InstrumentedHandlerFuture<
   }
 }
 
-impl<T, H: Handler<T, S>, S: Clone + Send + 'static> Handler<T, S> for InstrumentedHandler<H, S>
+impl<T, H: Handler<T, S>, S: Clone + Send + Sync + 'static> Handler<T, S>
+  for InstrumentedHandler<H, S>
 where
   H::Future: Unpin,
 {
@@ -265,29 +266,29 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
   let mut router = Router::new()
     .route("/", axum::routing::get(instrument_handler("index", index)))
     .route(
-      "/users/:user_id/hiscores",
+      "/users/{user_id}/hiscores",
       axum::routing::get(instrument_handler("get_hiscores", get_hiscores)),
     )
     .route(
-      "/users/:user_id/beatmaps/:beatmap_id/scores",
+      "/users/{user_id}/beatmaps/{beatmap_id}/scores",
       axum::routing::get(instrument_handler(
         "get_user_scores_for_beatmap",
         get_user_scores_for_beatmap,
       )),
     )
     .route(
-      "/users/:user_id/beatmaps/:beatmap_id/best",
+      "/users/{user_id}/beatmaps/{beatmap_id}/best",
       axum::routing::get(instrument_handler(
         "get_user_best_score_for_beatmap",
         get_user_best_score_for_beatmap,
       )),
     )
     .route(
-      "/users/:username/id",
+      "/users/{username}/id",
       axum::routing::get(instrument_handler("get_user_id", get_user_id)),
     )
     .route(
-      "/users/:user_id/username",
+      "/users/{user_id}/username",
       axum::routing::get(instrument_handler("get_username", get_username)),
     );
 
@@ -295,14 +296,14 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
   {
     router = router
       .route(
-        "/beatmaps/:beatmap_id/simulate",
+        "/beatmaps/{beatmap_id}/simulate",
         axum::routing::get(instrument_handler(
           "simulate_play",
           simulate_play::simulate_play_route,
         )),
       )
       .route(
-        "/beatmaps/:beatmap_id/simulate/batch",
+        "/beatmaps/{beatmap_id}/simulate/batch",
         axum::routing::post(instrument_handler(
           "batch_simulate_play",
           simulate_play::batch_simulate_play_route,
@@ -321,35 +322,35 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
         )),
       )
       .route(
-        "/daily-challenge/user/:user_id/history",
+        "/daily-challenge/user/{user_id}/history",
         axum::routing::get(instrument_handler(
           "get_user_daily_challenge_history",
           daily_challenge::get_user_daily_challenge_history,
         )),
       )
       .route(
-        "/daily-challenge/user/:user_id/day/:day_id",
+        "/daily-challenge/user/{user_id}/day/{day_id}",
         axum::routing::get(instrument_handler(
           "get_user_daily_challenge_for_day",
           daily_challenge::get_user_daily_challenge_for_day,
         )),
       )
       .route(
-        "/daily-challenge/user/:user_id/stats",
+        "/daily-challenge/user/{user_id}/stats",
         axum::routing::get(instrument_handler(
           "get_user_daily_challenge_stats",
           daily_challenge::get_user_daily_challenge_stats,
         )),
       )
       .route(
-        "/daily-challenge/day/:day_id/stats",
+        "/daily-challenge/day/{day_id}/stats",
         axum::routing::get(instrument_handler(
           "get_daily_challenge_stats_for_day",
           daily_challenge::get_daily_challenge_stats_for_day,
         )),
       )
       .route(
-        "/daily-challenge/day/:day_id/rankings",
+        "/daily-challenge/day/{day_id}/rankings",
         axum::routing::get(instrument_handler(
           "get_daily_challenge_rankings_for_day",
           daily_challenge::get_daily_challenge_rankings_for_day,
