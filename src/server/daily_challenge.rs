@@ -16,7 +16,7 @@ use crate::{
   util::serialize_json_bytes_opt,
 };
 
-use super::*;
+use super::{admin::validate_admin_api_token, *};
 
 async fn store_daily_challenge_metadata(
   txn: &mut sqlx::Transaction<'_, MySql>,
@@ -159,18 +159,7 @@ pub(super) async fn backfill_daily_challenges(
   }): Query<LoadUserTotalScoreRankingsQueryParams>,
   admin_api_token: String,
 ) -> Result<(), APIError> {
-  if admin_api_token != SETTINGS.get().unwrap().daily_challenge.admin_token {
-    if admin_api_token.is_empty() {
-      return Err(APIError {
-        status: StatusCode::BAD_REQUEST,
-        message: "Missing admin API token in request body".to_owned(),
-      });
-    }
-    return Err(APIError {
-      status: StatusCode::UNAUTHORIZED,
-      message: "Invalid admin API token in request body".to_owned(),
-    });
-  }
+  validate_admin_api_token(&admin_api_token)?;
 
   let mut all_daily_challenge_ids =
     osu_api::daily_challenge::get_daily_challenge_descriptors(false).await?;

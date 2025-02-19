@@ -217,7 +217,7 @@ pub struct Beatmap {
   pub beatmapset: Option<Beatmapset>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq, Debug)]
 pub struct User {
   pub id: u64,
   pub username: String,
@@ -423,14 +423,47 @@ pub async fn fetch_user_id(username: &str, mode: Ruleset) -> Result<u64, APIErro
   }
 }
 
-pub async fn fetch_username(user_id: u64) -> Result<String, APIError> {
+#[derive(Deserialize, PartialEq, Debug)]
+#[serde(untagged)]
+enum FetchUserRes {
+  User(User),
+  UserNotFound { error: Option<serde_json::Value> },
+}
+
+#[test]
+fn fetch_user_success_res_parse() {
+  let res_text = r#"{"id":4093752,"username":"ameo"}"#;
+  let deserializer = &mut serde_json::Deserializer::from_str(res_text);
+  let res: FetchUserRes = serde_path_to_error::deserialize(deserializer).unwrap();
+  assert_eq!(
+    res,
+    FetchUserRes::User(User {
+      id: 4093752,
+      username: "ameo".to_owned()
+    })
+  );
+}
+
+#[test]
+fn fetch_user_not_found_res_parse() {
+  let res_text = r#"{"error":null}"#;
+  let deserializer = &mut serde_json::Deserializer::from_str(res_text);
+  let res: FetchUserRes = serde_path_to_error::deserialize(deserializer).unwrap();
+  assert_eq!(res, FetchUserRes::UserNotFound { error: None });
+}
+
+pub async fn fetch_username(user_id: u64) -> Result<Option<String>, APIError> {
   let endpoint_name = "get_username";
   let proxy_url = format!("https://osu.ppy.sh/api/v2/users/{user_id}");
   let res_text = make_osu_api_request(&proxy_url, endpoint_name, Method::GET).await?;
 
   let deserializer = &mut serde_json::Deserializer::from_str(&res_text);
-  match serde_path_to_error::deserialize::<_, User>(deserializer) {
-    Ok(user) => Ok(user.username),
+  match serde_path_to_error::deserialize::<_, FetchUserRes>(deserializer) {
+    Ok(FetchUserRes::User(user)) => Ok(Some(user.username)),
+    Ok(FetchUserRes::UserNotFound { .. }) => {
+      warn!("User not found: {user_id}; res: {res_text}");
+      Ok(None)
+    },
     Err(err) => {
       error!("Failed to parse user response; res: {res_text}; err: {err}");
       http_server::osu_api_requests_failed_total(endpoint_name, 200).inc();

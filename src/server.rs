@@ -31,6 +31,8 @@ use crate::{
   settings::ServerSettings,
 };
 
+#[cfg(feature = "sql")]
+mod admin;
 #[cfg(feature = "daily_challenge")]
 mod daily_challenge;
 #[cfg(feature = "simulate_play")]
@@ -182,7 +184,14 @@ async fn get_username(Path(user_id): Path<u64>) -> Result<Json<String>, APIError
     }
   }
 
-  crate::osu_api::fetch_username(user_id).await.map(Json)
+  let username_opt = crate::osu_api::fetch_username(user_id).await?;
+  match username_opt {
+    Some(username) => Ok(Json(username)),
+    None => Err(APIError {
+      status: StatusCode::NOT_FOUND,
+      message: format!("User with id {} not found", user_id),
+    }),
+  }
 }
 
 #[derive(Clone)]
@@ -377,6 +386,17 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
           daily_challenge::get_latest_daily_challenge_day_id,
         )),
       )
+  }
+
+  #[cfg(feature = "sql")]
+  {
+    router = router.route(
+      "/verify-best-plays",
+      axum::routing::post(instrument_handler(
+        "verify_best_plays",
+        admin::verify_best_plays,
+      )),
+    );
   }
 
   router = router
