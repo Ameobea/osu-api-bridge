@@ -331,6 +331,13 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
         )),
       )
       .route(
+        "/daily-challenge/recompute-user-ranks",
+        axum::routing::post(instrument_handler(
+          "recompute_user_ranks",
+          daily_challenge::recompute_all_user_ranks,
+        )),
+      )
+      .route(
         "/daily-challenge/user/{user_id}/history",
         axum::routing::get(instrument_handler(
           "get_user_daily_challenge_history",

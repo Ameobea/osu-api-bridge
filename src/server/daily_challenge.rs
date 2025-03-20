@@ -88,19 +88,50 @@ pub(crate) struct UserDailyChallengeScore {
   user_rank: i64,
 }
 
+async fn build_and_run_user_daily_challenge_score_query(
+  txn: &mut sqlx::Transaction<'_, MySql>,
+  scores: Vec<UserDailyChallengeScore>,
+) -> sqlx::Result<()> {
+  let mut qb = QueryBuilder::new(
+    "INSERT INTO daily_challenge_rankings (day_id, user_id, score_id, pp, rank, statistics, \
+     total_score, started_at, ended_at, mods, max_combo, accuracy, user_rank) ",
+  );
+
+  qb.push_values(scores, |mut b, score| {
+    b.push_bind(score.day_id)
+      .push_bind(score.user_id)
+      .push_bind(score.score_id)
+      .push_bind(score.pp)
+      .push_bind(score.rank)
+      .push_bind(score.statistics)
+      .push_bind(score.total_score)
+      .push_bind(score.started_at)
+      .push_bind(score.ended_at)
+      .push_bind(score.mods)
+      .push_bind(score.max_combo)
+      .push_bind(score.accuracy)
+      .push_bind(score.user_rank);
+  });
+
+  qb.push(
+    "ON DUPLICATE KEY UPDATE pp = VALUES(pp), rank = VALUES(rank), statistics = \
+     VALUES(statistics), total_score = VALUES(total_score), started_at = VALUES(started_at), mods \
+     = VALUES(mods), max_combo = VALUES(max_combo), accuracy = VALUES(accuracy)",
+  );
+  let query = qb.build();
+  txn.execute(query).await?;
+  Ok(())
+}
+
 async fn store_daily_challenge_scores(
   day_id: usize,
   mut scores: Vec<DailyChallengeScore>,
   txn: &mut sqlx::Transaction<'_, MySql>,
 ) -> sqlx::Result<()> {
-  scores.sort_unstable_by_key(|score| Reverse((score.total_score, score.ended_at)));
+  scores.sort_unstable_by_key(|score| Reverse((score.total_score, Reverse(score.ended_at))));
 
   const CHUNK_SIZE: usize = 50;
   for (chunk_ix, scores) in scores.chunks(CHUNK_SIZE).enumerate() {
-    let mut qb: QueryBuilder<'_, MySql> = QueryBuilder::new(
-      "INSERT INTO daily_challenge_rankings (day_id, user_id, score_id, pp, rank, statistics, \
-       total_score, started_at, ended_at, mods, max_combo, accuracy, user_rank) ",
-    );
     let scores = scores
       .iter()
       .enumerate()
@@ -124,29 +155,8 @@ async fn store_daily_challenge_scores(
         }
       })
       .collect::<Vec<_>>();
-    qb.push_values(scores, |mut b, score| {
-      b.push_bind(score.day_id)
-        .push_bind(score.user_id)
-        .push_bind(score.score_id)
-        .push_bind(score.pp)
-        .push_bind(score.rank)
-        .push_bind(score.statistics)
-        .push_bind(score.total_score)
-        .push_bind(score.started_at)
-        .push_bind(score.ended_at)
-        .push_bind(score.mods)
-        .push_bind(score.max_combo)
-        .push_bind(score.accuracy)
-        .push_bind(score.user_rank);
-    });
 
-    qb.push(
-      "ON DUPLICATE KEY UPDATE pp = VALUES(pp), rank = VALUES(rank), statistics = \
-       VALUES(statistics), total_score = VALUES(total_score), started_at = VALUES(started_at), \
-       mods = VALUES(mods), max_combo = VALUES(max_combo), accuracy = VALUES(accuracy)",
-    );
-    let query = qb.build();
-    txn.execute(query).await?;
+    build_and_run_user_daily_challenge_score_query(txn, scores).await?;
   }
 
   Ok(())
@@ -293,6 +303,97 @@ pub(super) async fn backfill_daily_challenges(
       }
     }
   });
+
+  Ok(())
+}
+
+/// There was a bug computing `user_rank` in the `daily_challenge_rankings` table.  This endpoint
+/// loads all daily challenge scores and recomputes `user_rank` for each score then saves them back.
+pub(super) async fn recompute_all_user_ranks(admin_api_token: String) -> Result<(), APIError> {
+  validate_admin_api_token(&admin_api_token)?;
+
+  let mut txn = db_pool().begin().await.map_err(|err| {
+    error!("Failed to start transaction for daily challenge user rank recomputation: {err}");
+    APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: "Failed to start transaction for daily challenge user rank recomputation".to_owned(),
+    }
+  })?;
+
+  let all_day_ids: Vec<i32> =
+    sqlx::query_scalar!("SELECT DISTINCT day_id FROM daily_challenge_rankings")
+      .fetch_all(&mut *txn)
+      .await
+      .map_err(|err| {
+        error!("Failed to fetch all daily challenge IDs from DB: {err}");
+        APIError {
+          status: StatusCode::INTERNAL_SERVER_ERROR,
+          message: "Failed to fetch all daily challenge IDs from DB".to_owned(),
+        }
+      })?;
+
+  for day_id in all_day_ids {
+    let mut scores: Vec<UserDailyChallengeScore> = sqlx::query_as!(
+      UserDailyChallengeScore,
+      "SELECT day_id, user_id, score_id, pp, rank, statistics, total_score, started_at, ended_at, \
+       mods, max_combo, accuracy, user_rank FROM daily_challenge_rankings WHERE day_id = ?",
+      day_id
+    )
+    .fetch_all(&mut *txn)
+    .await
+    .map_err(|err| {
+      error!("Failed to fetch daily challenge scores from DB: {err}");
+      APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: "Failed to fetch daily challenge scores from DB".to_owned(),
+      }
+    })?;
+
+    scores.sort_unstable_by_key(|score| Reverse((score.total_score, Reverse(score.ended_at))));
+
+    for (ix, score) in scores.iter_mut().enumerate() {
+      score.user_rank = ix as i64 + 1;
+    }
+
+    // delete old scores for the day
+    sqlx::query!(
+      "DELETE FROM daily_challenge_rankings WHERE day_id = ?",
+      day_id
+    )
+    .execute(&mut *txn)
+    .await
+    .map_err(|err| {
+      error!("Failed to delete old daily challenge scores for day {day_id}: {err}");
+      APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: "Failed to delete old daily challenge scores".to_owned(),
+      }
+    })?;
+
+    const CHUNK_SIZE: usize = 50;
+    for chunk in scores.chunks(CHUNK_SIZE) {
+      // re-insert correctly sorted new ones
+      let res = build_and_run_user_daily_challenge_score_query(&mut txn, chunk.to_owned()).await;
+      if let Err(err) = res {
+        error!("Failed to store daily challenge scores in DB: {err}");
+        return Err(APIError {
+          status: StatusCode::INTERNAL_SERVER_ERROR,
+          message: "Failed to store daily challenge scores in DB".to_owned(),
+        });
+      }
+    }
+
+    info!("Successfully recomputed user ranks for daily challenge {day_id}");
+  }
+
+  txn.commit().await.map_err(|err| {
+    error!("Failed to commit transaction for daily challenge user rank recomputation: {err}");
+    APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: "Failed to commit transaction for daily challenge user rank recomputation"
+        .to_owned(),
+    }
+  })?;
 
   Ok(())
 }
@@ -1616,7 +1717,7 @@ pub(crate) async fn get_daily_challenge_rankings_for_day(
     LEFT JOIN users
       ON users.osu_id = daily_challenge_rankings.user_id
     WHERE day_id = ?
-    ORDER BY total_score DESC
+    ORDER BY total_score DESC, ended_at ASC
     LIMIT ?, ?
     "#,
     day_id as i64,
