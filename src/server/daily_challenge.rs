@@ -285,6 +285,66 @@ pub(super) async fn backfill_daily_challenges(
   });
 
   tokio::spawn(async move {
+    info!("Refreshing top 50% rankings cache...");
+    if let Some(rankings_store) = USER_TOP_50_PERCENT_RANKINGS.get() {
+      match load_user_top_n_percent_rankings(0.5).await {
+        Ok(new_rankings) => {
+          rankings_store.store(Arc::new(new_rankings));
+          info!("Refreshed top 50% rankings cache");
+        },
+        Err(err) => {
+          error!("Failed to refresh top 50% rankings cache: {err:?}");
+        },
+      }
+    } else {
+      match get_user_top_50_percent_rankings().await {
+        Ok(_) => info!("Refreshed top 50% rankings cache"),
+        Err(err) => error!("Failed to refresh top 50% rankings cache: {err:?}"),
+      }
+    }
+  });
+
+  tokio::spawn(async move {
+    info!("Refreshing top 10% rankings cache...");
+    if let Some(rankings_store) = USER_TOP_10_PERCENT_RANKINGS.get() {
+      match load_user_top_n_percent_rankings(0.1).await {
+        Ok(new_rankings) => {
+          rankings_store.store(Arc::new(new_rankings));
+          info!("Refreshed top 10% rankings cache");
+        },
+        Err(err) => {
+          error!("Failed to refresh top 10% rankings cache: {err:?}");
+        },
+      }
+    } else {
+      match get_user_top_10_percent_rankings().await {
+        Ok(_) => info!("Refreshed top 10% rankings cache"),
+        Err(err) => error!("Failed to refresh top 10% rankings cache: {err:?}"),
+      }
+    }
+  });
+
+  tokio::spawn(async move {
+    info!("Refreshing top 1% rankings cache...");
+    if let Some(rankings_store) = USER_TOP_1_PERCENT_RANKINGS.get() {
+      match load_user_top_n_percent_rankings(0.01).await {
+        Ok(new_rankings) => {
+          rankings_store.store(Arc::new(new_rankings));
+          info!("Refreshed top 1% rankings cache");
+        },
+        Err(err) => {
+          error!("Failed to refresh top 1% rankings cache: {err:?}");
+        },
+      }
+    } else {
+      match get_user_top_1_percent_rankings().await {
+        Ok(_) => info!("Refreshed top 1% rankings cache"),
+        Err(err) => error!("Failed to refresh top 1% rankings cache: {err:?}"),
+      }
+    }
+  });
+
+  tokio::spawn(async move {
     info!("Refreshing global daily challenge stats cache...");
     if let Some(global_stats) = GLOBAL_DAILY_CHALLENGE_STATS.get() {
       match load_global_daily_challenge_stats().await {
@@ -1018,7 +1078,7 @@ async fn populate_missing_usernames(
 async fn build_rankings(
   user_ids: &[usize],
   fetch_missing_usernames: bool,
-) -> Result<Vec<DailyChallengeRankingEntry>, APIError> {
+) -> Result<Vec<DailyChallengeTotalScoreRankingEntry>, APIError> {
   let mut conn = conn().await?;
 
   let (all_user_ids, missing_user_ids, _existing_user_ids) =
@@ -1055,10 +1115,10 @@ async fn build_rankings(
     }
   })?;
 
-  let rankings: Vec<DailyChallengeRankingEntry> = rankings
+  let rankings: Vec<DailyChallengeTotalScoreRankingEntry> = rankings
     .into_iter()
     .enumerate()
-    .map(|(rank, row)| DailyChallengeRankingEntry {
+    .map(|(rank, row)| DailyChallengeTotalScoreRankingEntry {
       user_id: row.user_id as u64,
       username: row.username.unwrap_or_else(|| "Unknown".to_owned()),
       rank: rank as u64 + 1,
@@ -1095,12 +1155,81 @@ async fn load_user_total_score_rankings(
   }
 
   let user_ids: Vec<usize> = rank_by_user_id.keys().copied().collect();
-  let rankings: Vec<DailyChallengeRankingEntry> =
+  let rankings: Vec<DailyChallengeTotalScoreRankingEntry> =
     build_rankings(&user_ids, fetch_missing_usernames).await?;
 
   Ok(UserTotalScoreRankings {
     rank_by_user_id,
     rankings,
+  })
+}
+
+async fn load_user_top_n_percent_rankings(percent: f32) -> Result<UserPercentRankings, APIError> {
+  struct PercentileRankEntry {
+    pub user_id: u64,
+    pub username: Option<String>,
+    pub top_percent_count: u64,
+  }
+
+  let entries = sqlx::query_as!(
+    PercentileRankEntry,
+    r#"
+    WITH
+    total_user_counts AS (
+      SELECT day_id, COUNT(DISTINCT(user_id)) as total_user_count
+      FROM daily_challenge_rankings
+      GROUP BY day_id
+    ),
+    user_total_scores AS (
+      SELECT user_id, SUM(total_score) as user_total_score_sum
+      FROM daily_challenge_rankings
+      GROUP BY user_id
+    ),
+    top_counts AS (
+      SELECT daily_challenge_rankings.user_id, COUNT(*) as top_percent_count, user_total_score_sum
+      FROM daily_challenge_rankings
+      INNER JOIN total_user_counts ON total_user_counts.day_id = daily_challenge_rankings.day_id
+      INNER JOIN user_total_scores ON user_total_scores.user_id = daily_challenge_rankings.user_id
+      WHERE (CAST(user_rank AS FLOAT) / CAST(total_user_count AS FLOAT)) <= ?
+      GROUP BY user_id
+    )
+    SELECT CAST(user_id AS UNSIGNED) as user_id, username, CAST(top_percent_count AS UNSIGNED) AS top_percent_count
+    FROM top_counts
+    LEFT JOIN users ON users.osu_id = top_counts.user_id
+    ORDER BY top_percent_count DESC, top_counts.user_total_score_sum DESC;"#,
+    percent,
+  )
+  .fetch_all(db_pool())
+  .await
+  .map_err(|err| {
+    error!("Failed to load user top {percent}% rankings from DB: {err}");
+    APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: "Failed to load user top {percent}% rankings from DB".to_owned(),
+    }
+  })?;
+  let entries: Vec<DailyChallengePercentRankingEntry> = entries
+    .into_iter()
+    .enumerate()
+    .map(|(rank, row)| DailyChallengePercentRankingEntry {
+      user_id: row.user_id,
+      username: row.username.unwrap_or_else(|| "Unknown".to_owned()),
+      rank: rank as u64 + 1,
+      top_percent_count: row.top_percent_count as usize,
+    })
+    .collect();
+
+  let mut rankings_by_user_id = FxHashMap::default();
+  let mut count_by_user_id = FxHashMap::default();
+  for entry in &entries {
+    rankings_by_user_id.insert(entry.user_id as usize, entry.rank as usize);
+    count_by_user_id.insert(entry.user_id as usize, entry.top_percent_count);
+  }
+
+  Ok(UserPercentRankings {
+    rank_by_user_id: rankings_by_user_id,
+    count_by_user_id,
+    rankings: entries,
   })
 }
 
@@ -1119,7 +1248,7 @@ pub struct DailyChallengeStatsForDay {
 }
 
 #[derive(Clone, Serialize)]
-pub(crate) struct DailyChallengeRankingEntry {
+pub(crate) struct DailyChallengeTotalScoreRankingEntry {
   user_id: u64,
   username: String,
   rank: u64,
@@ -1128,12 +1257,29 @@ pub(crate) struct DailyChallengeRankingEntry {
 
 pub(crate) struct UserTotalScoreRankings {
   rank_by_user_id: FxHashMap<usize, usize>,
-  rankings: Vec<DailyChallengeRankingEntry>,
+  rankings: Vec<DailyChallengeTotalScoreRankingEntry>,
+}
+
+#[derive(Clone, Serialize)]
+pub(crate) struct DailyChallengePercentRankingEntry {
+  pub user_id: u64,
+  pub username: String,
+  pub rank: u64,
+  pub top_percent_count: usize,
+}
+
+pub(crate) struct UserPercentRankings {
+  rank_by_user_id: FxHashMap<usize, usize>,
+  count_by_user_id: FxHashMap<usize, usize>,
+  rankings: Vec<DailyChallengePercentRankingEntry>,
 }
 
 static DAILY_CHALLENGE_STATS: OnceCell<ArcSwap<FxHashMap<usize, DailyChallengeStatsForDay>>> =
   OnceCell::const_new();
 static USER_TOTAL_SCORE_RANKINGS: OnceCell<ArcSwap<UserTotalScoreRankings>> = OnceCell::const_new();
+static USER_TOP_1_PERCENT_RANKINGS: OnceCell<ArcSwap<UserPercentRankings>> = OnceCell::const_new();
+static USER_TOP_10_PERCENT_RANKINGS: OnceCell<ArcSwap<UserPercentRankings>> = OnceCell::const_new();
+static USER_TOP_50_PERCENT_RANKINGS: OnceCell<ArcSwap<UserPercentRankings>> = OnceCell::const_new();
 static GLOBAL_DAILY_CHALLENGE_STATS: OnceCell<ArcSwap<GlobalDailyChallengeStats>> =
   OnceCell::const_new();
 
@@ -1164,6 +1310,51 @@ async fn get_user_total_score_rankings(
       let rankings = load_user_total_score_rankings(fetch_missing_usernames).await?;
       info!(
         "Fetched {} user total score rankings from DB",
+        rankings.rank_by_user_id.len()
+      );
+      Ok(ArcSwap::new(Arc::new(rankings)))
+    })
+    .await
+}
+
+async fn get_user_top_1_percent_rankings() -> Result<&'static ArcSwap<UserPercentRankings>, APIError>
+{
+  USER_TOP_1_PERCENT_RANKINGS
+    .get_or_try_init(|| async {
+      info!("Fetching user top 1% rankings from DB...");
+      let rankings = load_user_top_n_percent_rankings(0.01).await?;
+      info!(
+        "Fetched {} user top 1% rankings from DB",
+        rankings.rank_by_user_id.len()
+      );
+      Ok(ArcSwap::new(Arc::new(rankings)))
+    })
+    .await
+}
+
+async fn get_user_top_10_percent_rankings(
+) -> Result<&'static ArcSwap<UserPercentRankings>, APIError> {
+  USER_TOP_10_PERCENT_RANKINGS
+    .get_or_try_init(|| async {
+      info!("Fetching user top 10% rankings from DB...");
+      let rankings = load_user_top_n_percent_rankings(0.1).await?;
+      info!(
+        "Fetched {} user top 10% rankings from DB",
+        rankings.rank_by_user_id.len()
+      );
+      Ok(ArcSwap::new(Arc::new(rankings)))
+    })
+    .await
+}
+
+async fn get_user_top_50_percent_rankings(
+) -> Result<&'static ArcSwap<UserPercentRankings>, APIError> {
+  USER_TOP_50_PERCENT_RANKINGS
+    .get_or_try_init(|| async {
+      info!("Fetching user top 50% rankings from DB...");
+      let rankings = load_user_top_n_percent_rankings(0.5).await?;
+      info!(
+        "Fetched {} user top 50% rankings from DB",
         rankings.rank_by_user_id.len()
       );
       Ok(ArcSwap::new(Arc::new(rankings)))
@@ -1291,6 +1482,15 @@ pub(crate) struct Streaks {
   cur_weekly_streak: usize,
   best_daily_streak: usize,
   best_weekly_streak: usize,
+  cur_top_1_percent_streak: usize,
+  best_top_1_percent_streak: usize,
+  best_top_1_percent_streak_span: Option<(usize, usize)>,
+  cur_top_10_percent_streak: usize,
+  best_top_10_percent_streak: usize,
+  best_top_10_percent_streak_span: Option<(usize, usize)>,
+  cur_top_50_percent_streak: usize,
+  best_top_50_percent_streak: usize,
+  best_top_50_percent_streak_span: Option<(usize, usize)>,
 }
 
 #[derive(Default, Serialize)]
@@ -1323,8 +1523,12 @@ pub(crate) struct DailyChallengeUserStats {
   /// that the user submitted their best daily challenge score.
   pub time_of_day_distribution: Histogram,
   pub streaks: Streaks,
+  pub top_1_percent_count: usize,
+  pub top_1_percent_rank: Option<usize>,
   pub top_10_percent_count: usize,
+  pub top_10_percent_rank: Option<usize>,
   pub top_50_percent_count: usize,
+  pub top_50_percent_rank: Option<usize>,
   pub best_placement_absolute: Option<BestPlacement>,
   pub best_placement_percentile: Option<BestPlacement>,
   pub best_placement_score: Option<BestPlacement>,
@@ -1366,22 +1570,39 @@ fn start_of_week(date: NaiveDate) -> NaiveDate {
   start
 }
 
-fn compute_streaks(
+async fn compute_streaks(
   scores: &[MinimalUserDailyChallengeScore],
   last_daily_challenge_day_id: usize,
-) -> Streaks {
+) -> Result<Streaks, APIError> {
   if scores.is_empty() {
-    return Streaks::default();
+    return Ok(Streaks::default());
   }
 
-  let mut cur_daily_streak = 1;
-  let mut best_daily_streak = 1;
+  let mut cur_daily_streak = 1usize;
+  let mut cur_top_1_percent_streak = 0usize;
+  let mut cur_top_1_percent_streak_span: Option<(usize, usize)> = None;
+  let mut cur_top_10_percent_streak = 0usize;
+  let mut cur_top_10_percent_streak_span: Option<(usize, usize)> = None;
+  let mut cur_top_50_percent_streak = 0usize;
+  let mut cur_top_50_percent_streak_span: Option<(usize, usize)> = None;
+  let mut best_daily_streak = 1usize;
+  let mut best_top_1_percent_streak = 0usize;
+  let mut best_top_1_percent_streak_span: Option<(usize, usize)> = None;
+  let mut best_top_10_percent_streak = 0usize;
+  let mut best_top_10_percent_streak_span: Option<(usize, usize)> = None;
+  let mut best_top_50_percent_streak = 0usize;
+  let mut best_top_50_percent_streak_span: Option<(usize, usize)> = None;
 
   let mut seen_week_ids = FxHashSet::default();
   seen_week_ids.insert(start_of_week(day_id_to_naive_date(
     scores[0].day_id as usize,
   )));
 
+  let mut last_top_1_percent_day_id: Option<usize> = None;
+  let mut last_top_10_percent_day_id: Option<usize> = None;
+  let mut last_top_50_percent_day_id: Option<usize> = None;
+
+  let stats = get_daily_challenge_stats().await?.load();
   for i in 1..scores.len() {
     let prev = &scores[i - 1];
     let prev_date = day_id_to_naive_date(prev.day_id as usize);
@@ -1396,6 +1617,98 @@ fn compute_streaks(
     }
 
     seen_week_ids.insert(start_of_week(cur_date));
+  }
+
+  for i in 0..scores.len() {
+    let cur = &scores[i];
+    let cur_date = day_id_to_naive_date(cur.day_id as usize);
+
+    let total_rankings_for_day = stats
+      .get(&(cur.day_id as usize))
+      .map(|s| s.total_scores)
+      .unwrap_or(0);
+    let percentile = (cur.user_rank as f32 / total_rankings_for_day as f32) * 100.;
+    let is_top_1_percent = percentile <= 1.;
+    let is_top_10_percent = percentile <= 10.;
+    let is_top_50_percent = percentile <= 50.;
+
+    if is_top_1_percent {
+      if let Some(last_day_id) = last_top_1_percent_day_id {
+        let prev_date = day_id_to_naive_date(last_day_id);
+        let is_successive = prev_date.succ_opt().unwrap() == cur_date;
+
+        if is_successive {
+          cur_top_1_percent_streak += 1;
+          cur_top_1_percent_streak_span.as_mut().unwrap().1 = cur.day_id as usize;
+        } else {
+          cur_top_1_percent_streak = 1;
+          cur_top_1_percent_streak_span = Some((cur.day_id as usize, cur.day_id as usize));
+        }
+      } else {
+        cur_top_1_percent_streak = 1;
+        cur_top_1_percent_streak_span = Some((cur.day_id as usize, cur.day_id as usize));
+      }
+      last_top_1_percent_day_id = Some(cur.day_id as usize);
+
+      if cur_top_1_percent_streak > best_top_1_percent_streak {
+        best_top_1_percent_streak = cur_top_1_percent_streak;
+        best_top_1_percent_streak_span = cur_top_1_percent_streak_span;
+      }
+    } else {
+      cur_top_1_percent_streak = 0;
+    }
+
+    if is_top_10_percent {
+      if let Some(last_day_id) = last_top_10_percent_day_id {
+        let prev_date = day_id_to_naive_date(last_day_id);
+        let is_successive = prev_date.succ_opt().unwrap() == cur_date;
+
+        if is_successive {
+          cur_top_10_percent_streak += 1;
+          cur_top_10_percent_streak_span.as_mut().unwrap().1 = cur.day_id as usize;
+        } else {
+          cur_top_10_percent_streak = 1;
+          cur_top_10_percent_streak_span = Some((cur.day_id as usize, cur.day_id as usize));
+        }
+      } else {
+        cur_top_10_percent_streak = 1;
+        cur_top_10_percent_streak_span = Some((cur.day_id as usize, cur.day_id as usize));
+      }
+      last_top_10_percent_day_id = Some(cur.day_id as usize);
+
+      if cur_top_10_percent_streak > best_top_10_percent_streak {
+        best_top_10_percent_streak = cur_top_10_percent_streak;
+        best_top_10_percent_streak_span = cur_top_10_percent_streak_span;
+      }
+    } else {
+      cur_top_10_percent_streak = 0;
+    }
+
+    if is_top_50_percent {
+      if let Some(last_day_id) = last_top_50_percent_day_id {
+        let prev_date = day_id_to_naive_date(last_day_id);
+        let is_successive = prev_date.succ_opt().unwrap() == cur_date;
+
+        if is_successive {
+          cur_top_50_percent_streak += 1;
+          cur_top_50_percent_streak_span.as_mut().unwrap().1 = cur.day_id as usize;
+        } else {
+          cur_top_50_percent_streak = 1;
+          cur_top_50_percent_streak_span = Some((cur.day_id as usize, cur.day_id as usize));
+        }
+      } else {
+        cur_top_50_percent_streak = 1;
+        cur_top_50_percent_streak_span = Some((cur.day_id as usize, cur.day_id as usize));
+      }
+      last_top_50_percent_day_id = Some(cur.day_id as usize);
+
+      if cur_top_50_percent_streak > best_top_50_percent_streak {
+        best_top_50_percent_streak = cur_top_50_percent_streak;
+        best_top_50_percent_streak_span = cur_top_50_percent_streak_span;
+      }
+    } else {
+      cur_top_50_percent_streak = 0;
+    }
   }
 
   let mut all_week_ids: Vec<NaiveDate> = seen_week_ids.into_iter().collect();
@@ -1426,12 +1739,21 @@ fn compute_streaks(
     cur_weekly_streak = 0;
   }
 
-  Streaks {
+  Ok(Streaks {
     cur_daily_streak,
     cur_weekly_streak,
     best_daily_streak: best_daily_streak.max(cur_daily_streak),
     best_weekly_streak: best_weekly_streak.max(cur_weekly_streak),
-  }
+    cur_top_1_percent_streak,
+    best_top_1_percent_streak,
+    best_top_1_percent_streak_span,
+    cur_top_10_percent_streak,
+    best_top_10_percent_streak,
+    best_top_10_percent_streak_span,
+    cur_top_50_percent_streak,
+    best_top_50_percent_streak,
+    best_top_50_percent_streak_span,
+  })
 }
 
 pub(crate) async fn get_user_daily_challenge_stats(
@@ -1475,8 +1797,26 @@ pub(crate) async fn get_user_daily_challenge_stats(
       (total_score_rank as f32) / (total_user_count as f32) * 100.,
     )
   };
-  let mut top_10_percent_count = 0;
-  let mut top_50_percent_count = 0;
+
+  let (top_1_percent_rank, top_1_percent_count) = {
+    let stats = get_user_top_1_percent_rankings().await?.load();
+    let top_1_percent_rank = stats.rank_by_user_id.get(&user_id).copied();
+    let top_1_percent_count = stats.count_by_user_id.get(&user_id).copied().unwrap_or(0);
+    (top_1_percent_rank, top_1_percent_count)
+  };
+  let (top_10_percent_rank, top_10_percent_count) = {
+    let stats = get_user_top_10_percent_rankings().await?.load();
+    let top_10_percent_rank = stats.rank_by_user_id.get(&user_id).copied();
+    let top_10_percent_count = stats.count_by_user_id.get(&user_id).copied().unwrap_or(0);
+    (top_10_percent_rank, top_10_percent_count)
+  };
+  let (top_50_percent_rank, top_50_percent_count) = {
+    let stats = get_user_top_50_percent_rankings().await?.load();
+    let top_50_percent_rank = stats.rank_by_user_id.get(&user_id).copied();
+    let top_50_percent_count = stats.count_by_user_id.get(&user_id).copied().unwrap_or(0);
+    (top_50_percent_rank, top_50_percent_count)
+  };
+
   let mut best_placement_absolute: BestPlacement = BestPlacement::default();
   let mut best_placement_percentile: BestPlacement = BestPlacement::default();
   let mut best_placement_score: BestPlacement = BestPlacement::default();
@@ -1517,7 +1857,7 @@ pub(crate) async fn get_user_daily_challenge_stats(
     (time_of_day_histogram_max - time_of_day_histogram_min) / time_of_day_histogram_bucket_count;
 
   let last_daily_challenge_day_id = stats.keys().max().copied().unwrap();
-  let streaks = compute_streaks(&scores, last_daily_challenge_day_id);
+  let streaks = compute_streaks(&scores, last_daily_challenge_day_id).await?;
   let mut most_used_mods = FxHashMap::default();
 
   for score in &scores {
@@ -1529,13 +1869,6 @@ pub(crate) async fn get_user_daily_challenge_stats(
       .unwrap_or(0);
 
     let percentile = (score.user_rank as f32 / total_rankings as f32) * 100.;
-
-    if percentile <= 10. {
-      top_10_percent_count += 1;
-    }
-    if percentile <= 50. {
-      top_50_percent_count += 1;
-    }
 
     if best_placement_absolute.rank == 0
       || (score.user_rank as usize) < best_placement_absolute.rank
@@ -1658,8 +1991,12 @@ pub(crate) async fn get_user_daily_challenge_stats(
       buckets: time_of_day_histogram,
     },
     streaks,
+    top_1_percent_count,
+    top_1_percent_rank,
     top_10_percent_count,
     top_50_percent_count,
+    top_10_percent_rank,
+    top_50_percent_rank,
     best_placement_absolute: if best_placement_absolute.rank == 0 {
       None
     } else {
@@ -1704,7 +2041,7 @@ pub(crate) async fn get_daily_challenge_rankings_for_day(
     page,
     fetch_missing_usernames: _,
   }): Query<LoadUserTotalScoreRankingsQueryParams>,
-) -> Result<Json<Vec<DailyChallengeRankingEntry>>, APIError> {
+) -> Result<Json<Vec<DailyChallengeTotalScoreRankingEntry>>, APIError> {
   let page_size = 50;
   let start = (page.unwrap_or(1).max(1) - 1) * page_size;
   let query = sqlx::query!(
@@ -1731,10 +2068,10 @@ pub(crate) async fn get_daily_challenge_rankings_for_day(
       message: "Failed to load daily challenge rankings from DB".to_owned(),
     }
   })?;
-  let rankings: Vec<DailyChallengeRankingEntry> = rankings
+  let rankings: Vec<DailyChallengeTotalScoreRankingEntry> = rankings
     .into_iter()
     .enumerate()
-    .map(|(i, row)| DailyChallengeRankingEntry {
+    .map(|(i, row)| DailyChallengeTotalScoreRankingEntry {
       user_id: row.user_id,
       username: row.username,
       rank: start as u64 + i as u64 + 1,
@@ -1745,17 +2082,17 @@ pub(crate) async fn get_daily_challenge_rankings_for_day(
 }
 
 #[derive(Serialize)]
-pub(crate) struct GetDailyChallengeRankingsResponse {
-  pub rankings: Vec<DailyChallengeRankingEntry>,
+pub(crate) struct GetDailyChallengeTotalScoreRankingsResponse {
+  pub rankings: Vec<DailyChallengeTotalScoreRankingEntry>,
   pub total_rankings: usize,
 }
 
-pub(crate) async fn get_daily_challenge_rankings(
+pub(crate) async fn get_daily_challenge_total_score_rankings(
   Query(LoadUserTotalScoreRankingsQueryParams {
     page,
     fetch_missing_usernames: _,
   }): Query<LoadUserTotalScoreRankingsQueryParams>,
-) -> Result<Json<GetDailyChallengeRankingsResponse>, APIError> {
+) -> Result<Json<GetDailyChallengeTotalScoreRankingsResponse>, APIError> {
   let rankings = get_user_total_score_rankings(false).await?.load();
   let page_size = 50;
   let start = page.unwrap_or(1).max(1) * page_size - page_size;
@@ -1764,10 +2101,73 @@ pub(crate) async fn get_daily_challenge_rankings(
     .rankings
     .get(start..(end.min(rankings.rankings.len() - 1)))
     .unwrap_or_default();
-  Ok(Json(GetDailyChallengeRankingsResponse {
+  Ok(Json(GetDailyChallengeTotalScoreRankingsResponse {
     rankings: page_rankings.to_owned(),
     total_rankings: rankings.rankings.len(),
   }))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct GetDailyChallengePercentRankingsQueryParams {
+  page: Option<usize>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct GetDailyChallengePercentRankingsResponse {
+  pub rankings: Vec<DailyChallengePercentRankingEntry>,
+  pub total_rankings: usize,
+}
+
+async fn get_daily_challenge_percent_rankings(
+  percent: usize,
+  page: Option<usize>,
+) -> Result<Json<GetDailyChallengePercentRankingsResponse>, APIError> {
+  let page_size = 50;
+  let start = page.unwrap_or(1).max(1) * page_size - page_size;
+  let end = start + page_size;
+  let rankings = match percent {
+    50 => get_user_top_50_percent_rankings().await?.load(),
+    10 => get_user_top_10_percent_rankings().await?.load(),
+    1 => get_user_top_1_percent_rankings().await?.load(),
+    _ => {
+      return Err(APIError {
+        status: StatusCode::BAD_REQUEST,
+        message: "Invalid percent".to_owned(),
+      });
+    },
+  };
+  let page_rankings = rankings
+    .rankings
+    .get(start..(end.min(rankings.rankings.len() - 1)))
+    .unwrap_or_default();
+  Ok(Json(GetDailyChallengePercentRankingsResponse {
+    rankings: page_rankings.to_owned(),
+    total_rankings: rankings.rankings.len(),
+  }))
+}
+
+pub(crate) async fn get_daily_challenge_top_50_percent_rankings(
+  Query(GetDailyChallengePercentRankingsQueryParams { page }): Query<
+    GetDailyChallengePercentRankingsQueryParams,
+  >,
+) -> Result<Json<GetDailyChallengePercentRankingsResponse>, APIError> {
+  get_daily_challenge_percent_rankings(50, page).await
+}
+
+pub(crate) async fn get_daily_challenge_top_10_percent_rankings(
+  Query(GetDailyChallengePercentRankingsQueryParams { page }): Query<
+    GetDailyChallengePercentRankingsQueryParams,
+  >,
+) -> Result<Json<GetDailyChallengePercentRankingsResponse>, APIError> {
+  get_daily_challenge_percent_rankings(10, page).await
+}
+
+pub(crate) async fn get_daily_challenge_top_1_percent_rankings(
+  Query(GetDailyChallengePercentRankingsQueryParams { page }): Query<
+    GetDailyChallengePercentRankingsQueryParams,
+  >,
+) -> Result<Json<GetDailyChallengePercentRankingsResponse>, APIError> {
+  get_daily_challenge_percent_rankings(1, page).await
 }
 
 pub(crate) async fn get_daily_challenge_global_stats(
