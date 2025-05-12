@@ -1280,6 +1280,8 @@ static USER_TOTAL_SCORE_RANKINGS: OnceCell<ArcSwap<UserTotalScoreRankings>> = On
 static USER_TOP_1_PERCENT_RANKINGS: OnceCell<ArcSwap<UserPercentRankings>> = OnceCell::const_new();
 static USER_TOP_10_PERCENT_RANKINGS: OnceCell<ArcSwap<UserPercentRankings>> = OnceCell::const_new();
 static USER_TOP_50_PERCENT_RANKINGS: OnceCell<ArcSwap<UserPercentRankings>> = OnceCell::const_new();
+static USER_TOP_100_PERCENT_RANKINGS: OnceCell<ArcSwap<UserPercentRankings>> =
+  OnceCell::const_new();
 static GLOBAL_DAILY_CHALLENGE_STATS: OnceCell<ArcSwap<GlobalDailyChallengeStats>> =
   OnceCell::const_new();
 
@@ -1355,6 +1357,21 @@ async fn get_user_top_50_percent_rankings(
       let rankings = load_user_top_n_percent_rankings(0.5).await?;
       info!(
         "Fetched {} user top 50% rankings from DB",
+        rankings.rank_by_user_id.len()
+      );
+      Ok(ArcSwap::new(Arc::new(rankings)))
+    })
+    .await
+}
+
+async fn get_user_top_100_percent_rankings(
+) -> Result<&'static ArcSwap<UserPercentRankings>, APIError> {
+  USER_TOP_100_PERCENT_RANKINGS
+    .get_or_try_init(|| async {
+      info!("Fetching user top 100% rankings from DB...");
+      let rankings = load_user_top_n_percent_rankings(1.0).await?;
+      info!(
+        "Fetched {} user top 100% rankings from DB",
         rankings.rank_by_user_id.len()
       );
       Ok(ArcSwap::new(Arc::new(rankings)))
@@ -1611,6 +1628,7 @@ async fn compute_streaks(
 
     if prev_date.succ_opt().unwrap() == cur_date {
       cur_daily_streak += 1;
+      best_daily_streak = best_daily_streak.max(cur_daily_streak);
     } else {
       best_daily_streak = best_daily_streak.max(cur_daily_streak);
       cur_daily_streak = 1;
@@ -1723,6 +1741,7 @@ async fn compute_streaks(
 
     if *cur_week == prev_week.checked_add_days(Days::new(7)).unwrap() {
       cur_weekly_streak += 1;
+      best_weekly_streak = best_weekly_streak.max(cur_weekly_streak);
     } else {
       best_weekly_streak = best_weekly_streak.max(cur_weekly_streak);
       cur_weekly_streak = 1;
@@ -1732,6 +1751,9 @@ async fn compute_streaks(
   let last_daily_challenge_date = day_id_to_naive_date(last_daily_challenge_day_id);
   if last_daily_challenge_day_id != scores.last().unwrap().day_id as usize {
     cur_daily_streak = 0;
+    cur_top_1_percent_streak = 0;
+    cur_top_10_percent_streak = 0;
+    cur_top_50_percent_streak = 0;
   }
 
   let last_challenge_week = start_of_week(last_daily_challenge_date);
@@ -2126,6 +2148,7 @@ async fn get_daily_challenge_percent_rankings(
   let start = page.unwrap_or(1).max(1) * page_size - page_size;
   let end = start + page_size;
   let rankings = match percent {
+    100 => get_user_top_100_percent_rankings().await?.load(),
     50 => get_user_top_50_percent_rankings().await?.load(),
     10 => get_user_top_10_percent_rankings().await?.load(),
     1 => get_user_top_1_percent_rankings().await?.load(),
