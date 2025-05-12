@@ -380,6 +380,13 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
         )),
       )
       .route(
+        "/daily-challenge/rankings/percent/100",
+        axum::routing::get(instrument_handler(
+          "get_daily_challenge_rankings_percent_100",
+          daily_challenge::get_daily_challenge_top_100_percent_rankings,
+        )),
+      )
+      .route(
         "/daily-challenge/rankings/percent/50",
         axum::routing::get(instrument_handler(
           "get_daily_challenge_rankings_percent_50",
@@ -398,6 +405,13 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
         axum::routing::get(instrument_handler(
           "get_daily_challenge_rankings_percent_1",
           daily_challenge::get_daily_challenge_top_1_percent_rankings,
+        )),
+      )
+      .route(
+        "/daily-challenge/rankings/first-place",
+        axum::routing::get(instrument_handler(
+          "get_daily_challenge_rankings_first_place",
+          daily_challenge::get_daily_challenge_first_place_rankings,
         )),
       )
       .route(

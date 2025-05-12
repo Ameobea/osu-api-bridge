@@ -285,6 +285,26 @@ pub(super) async fn backfill_daily_challenges(
   });
 
   tokio::spawn(async move {
+    info!("Refreshing user top 100% rankings cache...");
+    if let Some(rankings_store) = USER_TOP_100_PERCENT_RANKINGS.get() {
+      match load_user_top_n_percent_rankings(1.0).await {
+        Ok(new_rankings) => {
+          rankings_store.store(Arc::new(new_rankings));
+          info!("Refreshed user top 100% rankings cache");
+        },
+        Err(err) => {
+          error!("Failed to refresh user top 100% rankings cache: {err:?}");
+        },
+      }
+    } else {
+      match get_user_top_100_percent_rankings().await {
+        Ok(_) => info!("Refreshed user top 100% rankings cache"),
+        Err(err) => error!("Failed to refresh user top 100% rankings cache: {err:?}"),
+      }
+    }
+  });
+
+  tokio::spawn(async move {
     info!("Refreshing top 50% rankings cache...");
     if let Some(rankings_store) = USER_TOP_50_PERCENT_RANKINGS.get() {
       match load_user_top_n_percent_rankings(0.5).await {
@@ -340,6 +360,26 @@ pub(super) async fn backfill_daily_challenges(
       match get_user_top_1_percent_rankings().await {
         Ok(_) => info!("Refreshed top 1% rankings cache"),
         Err(err) => error!("Failed to refresh top 1% rankings cache: {err:?}"),
+      }
+    }
+  });
+
+  tokio::spawn(async move {
+    info!("Refreshing first place count rankings cache...");
+    if let Some(rankings_store) = USER_FIRST_PLACE_RANKINGS.get() {
+      match load_user_first_place_rankings().await {
+        Ok(new_rankings) => {
+          rankings_store.store(Arc::new(new_rankings));
+          info!("Refreshed first place count rankings cache");
+        },
+        Err(err) => {
+          error!("Failed to refresh first place count rankings cache: {err:?}");
+        },
+      }
+    } else {
+      match get_user_first_place_count_rankings().await {
+        Ok(_) => info!("Refreshed first place count rankings cache"),
+        Err(err) => error!("Failed to refresh first place count rankings cache: {err:?}"),
       }
     }
   });
@@ -1164,13 +1204,39 @@ async fn load_user_total_score_rankings(
   })
 }
 
-async fn load_user_top_n_percent_rankings(percent: f32) -> Result<UserPercentRankings, APIError> {
-  struct PercentileRankEntry {
-    pub user_id: u64,
-    pub username: Option<String>,
-    pub top_percent_count: u64,
+struct PercentileRankEntry {
+  pub user_id: u64,
+  pub username: Option<String>,
+  pub top_percent_count: u64,
+}
+
+async fn collate_user_percent_rankings(entries: Vec<PercentileRankEntry>) -> UserPercentRankings {
+  let entries: Vec<DailyChallengePercentRankingEntry> = entries
+    .into_iter()
+    .enumerate()
+    .map(|(rank, row)| DailyChallengePercentRankingEntry {
+      user_id: row.user_id,
+      username: row.username.unwrap_or_else(|| "Unknown".to_owned()),
+      rank: rank as u64 + 1,
+      top_percent_count: row.top_percent_count as usize,
+    })
+    .collect();
+
+  let mut rankings_by_user_id = FxHashMap::default();
+  let mut count_by_user_id = FxHashMap::default();
+  for entry in &entries {
+    rankings_by_user_id.insert(entry.user_id as usize, entry.rank as usize);
+    count_by_user_id.insert(entry.user_id as usize, entry.top_percent_count);
   }
 
+  UserPercentRankings {
+    rank_by_user_id: rankings_by_user_id,
+    count_by_user_id,
+    rankings: entries,
+  }
+}
+
+async fn load_user_top_n_percent_rankings(percent: f32) -> Result<UserPercentRankings, APIError> {
   let entries = sqlx::query_as!(
     PercentileRankEntry,
     r#"
@@ -1208,29 +1274,50 @@ async fn load_user_top_n_percent_rankings(percent: f32) -> Result<UserPercentRan
       message: "Failed to load user top {percent}% rankings from DB".to_owned(),
     }
   })?;
-  let entries: Vec<DailyChallengePercentRankingEntry> = entries
-    .into_iter()
-    .enumerate()
-    .map(|(rank, row)| DailyChallengePercentRankingEntry {
-      user_id: row.user_id,
-      username: row.username.unwrap_or_else(|| "Unknown".to_owned()),
-      rank: rank as u64 + 1,
-      top_percent_count: row.top_percent_count as usize,
-    })
-    .collect();
 
-  let mut rankings_by_user_id = FxHashMap::default();
-  let mut count_by_user_id = FxHashMap::default();
-  for entry in &entries {
-    rankings_by_user_id.insert(entry.user_id as usize, entry.rank as usize);
-    count_by_user_id.insert(entry.user_id as usize, entry.top_percent_count);
-  }
+  Ok(collate_user_percent_rankings(entries).await)
+}
 
-  Ok(UserPercentRankings {
-    rank_by_user_id: rankings_by_user_id,
-    count_by_user_id,
-    rankings: entries,
-  })
+// same as above, but only looks at first place scores rather than top n%
+async fn load_user_first_place_rankings() -> Result<UserPercentRankings, APIError> {
+  let entries = sqlx::query_as!(
+    PercentileRankEntry,
+    r#"
+    WITH
+    total_user_counts AS (
+      SELECT day_id, COUNT(DISTINCT(user_id)) as total_user_count
+      FROM daily_challenge_rankings
+      GROUP BY day_id
+    ),
+    user_total_scores AS (
+      SELECT user_id, SUM(total_score) as user_total_score_sum
+      FROM daily_challenge_rankings
+      GROUP BY user_id
+    ),
+    top_counts AS (
+      SELECT daily_challenge_rankings.user_id, COUNT(*) as top_percent_count, user_total_score_sum
+      FROM daily_challenge_rankings
+      INNER JOIN total_user_counts ON total_user_counts.day_id = daily_challenge_rankings.day_id
+      INNER JOIN user_total_scores ON user_total_scores.user_id = daily_challenge_rankings.user_id
+      WHERE user_rank = 1
+      GROUP BY user_id
+    )
+    SELECT CAST(user_id AS UNSIGNED) as user_id, username, CAST(top_percent_count AS UNSIGNED) AS top_percent_count
+    FROM top_counts
+    LEFT JOIN users ON users.osu_id = top_counts.user_id
+    ORDER BY top_percent_count DESC, top_counts.user_total_score_sum DESC;"#,
+  )
+  .fetch_all(db_pool())
+  .await
+  .map_err(|err| {
+    error!("Failed to load user first place count rankings from DB: {err}");
+    APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: "Failed to load user first place count rankings from DB".to_owned(),
+    }
+  })?;
+
+  Ok(collate_user_percent_rankings(entries).await)
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -1282,6 +1369,7 @@ static USER_TOP_10_PERCENT_RANKINGS: OnceCell<ArcSwap<UserPercentRankings>> = On
 static USER_TOP_50_PERCENT_RANKINGS: OnceCell<ArcSwap<UserPercentRankings>> = OnceCell::const_new();
 static USER_TOP_100_PERCENT_RANKINGS: OnceCell<ArcSwap<UserPercentRankings>> =
   OnceCell::const_new();
+static USER_FIRST_PLACE_RANKINGS: OnceCell<ArcSwap<UserPercentRankings>> = OnceCell::const_new();
 static GLOBAL_DAILY_CHALLENGE_STATS: OnceCell<ArcSwap<GlobalDailyChallengeStats>> =
   OnceCell::const_new();
 
@@ -1312,6 +1400,21 @@ async fn get_user_total_score_rankings(
       let rankings = load_user_total_score_rankings(fetch_missing_usernames).await?;
       info!(
         "Fetched {} user total score rankings from DB",
+        rankings.rank_by_user_id.len()
+      );
+      Ok(ArcSwap::new(Arc::new(rankings)))
+    })
+    .await
+}
+
+async fn get_user_first_place_count_rankings(
+) -> Result<&'static ArcSwap<UserPercentRankings>, APIError> {
+  USER_FIRST_PLACE_RANKINGS
+    .get_or_try_init(|| async {
+      info!("Fetching user first place count rankings from DB...");
+      let rankings = load_user_first_place_rankings().await?;
+      info!(
+        "Fetched {} user first place count rankings from DB",
         rankings.rank_by_user_id.len()
       );
       Ok(ArcSwap::new(Arc::new(rankings)))
@@ -1540,6 +1643,8 @@ pub(crate) struct DailyChallengeUserStats {
   /// that the user submitted their best daily challenge score.
   pub time_of_day_distribution: Histogram,
   pub streaks: Streaks,
+  pub first_place_count: usize,
+  pub first_place_rank: Option<usize>,
   pub top_1_percent_count: usize,
   pub top_1_percent_rank: Option<usize>,
   pub top_10_percent_count: usize,
@@ -1820,6 +1925,12 @@ pub(crate) async fn get_user_daily_challenge_stats(
     )
   };
 
+  let (first_place_rank, first_place_count) = {
+    let stats = get_user_first_place_count_rankings().await?.load();
+    let first_place_rank = stats.rank_by_user_id.get(&user_id).copied();
+    let first_place_count = stats.count_by_user_id.get(&user_id).copied().unwrap_or(0);
+    (first_place_rank, first_place_count)
+  };
   let (top_1_percent_rank, top_1_percent_count) = {
     let stats = get_user_top_1_percent_rankings().await?.load();
     let top_1_percent_rank = stats.rank_by_user_id.get(&user_id).copied();
@@ -2013,6 +2124,8 @@ pub(crate) async fn get_user_daily_challenge_stats(
       buckets: time_of_day_histogram,
     },
     streaks,
+    first_place_count,
+    first_place_rank,
     top_1_percent_count,
     top_1_percent_rank,
     top_10_percent_count,
@@ -2152,6 +2265,7 @@ async fn get_daily_challenge_percent_rankings(
     50 => get_user_top_50_percent_rankings().await?.load(),
     10 => get_user_top_10_percent_rankings().await?.load(),
     1 => get_user_top_1_percent_rankings().await?.load(),
+    0 => get_user_first_place_count_rankings().await?.load(),
     _ => {
       return Err(APIError {
         status: StatusCode::BAD_REQUEST,
@@ -2167,6 +2281,14 @@ async fn get_daily_challenge_percent_rankings(
     rankings: page_rankings.to_owned(),
     total_rankings: rankings.rankings.len(),
   }))
+}
+
+pub(crate) async fn get_daily_challenge_top_100_percent_rankings(
+  Query(GetDailyChallengePercentRankingsQueryParams { page }): Query<
+    GetDailyChallengePercentRankingsQueryParams,
+  >,
+) -> Result<Json<GetDailyChallengePercentRankingsResponse>, APIError> {
+  get_daily_challenge_percent_rankings(100, page).await
 }
 
 pub(crate) async fn get_daily_challenge_top_50_percent_rankings(
@@ -2191,6 +2313,14 @@ pub(crate) async fn get_daily_challenge_top_1_percent_rankings(
   >,
 ) -> Result<Json<GetDailyChallengePercentRankingsResponse>, APIError> {
   get_daily_challenge_percent_rankings(1, page).await
+}
+
+pub(crate) async fn get_daily_challenge_first_place_rankings(
+  Query(GetDailyChallengePercentRankingsQueryParams { page }): Query<
+    GetDailyChallengePercentRankingsQueryParams,
+  >,
+) -> Result<Json<GetDailyChallengePercentRankingsResponse>, APIError> {
+  get_daily_challenge_percent_rankings(0, page).await
 }
 
 pub(crate) async fn get_daily_challenge_global_stats(
