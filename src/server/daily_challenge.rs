@@ -1065,18 +1065,26 @@ async fn load_global_daily_challenge_stats() -> Result<GlobalDailyChallengeStats
 async fn get_existing_user_ids(
   user_ids: &[usize],
 ) -> sqlx::Result<(FxHashSet<usize>, Vec<usize>, FxHashSet<usize>)> {
-  let mut qb = QueryBuilder::new("SELECT osu_id FROM users WHERE osu_id IN ");
-  qb.push_tuples(user_ids, |mut b, &osu_id| {
-    b.push_bind(osu_id as i64);
-  });
-  let query = qb.build();
+  const CHUNK_SIZE: usize = 10_000;
 
-  let res: Vec<MySqlRow> = query.fetch_all(db_pool()).await?;
   let all_user_ids: FxHashSet<usize> = user_ids.iter().copied().collect();
-  let existing_user_ids: FxHashSet<usize> = res
-    .into_iter()
-    .map(|row| sqlx::Row::get::<i64, _>(&row, 0usize) as usize)
-    .collect();
+  let mut existing_user_ids: FxHashSet<usize> = FxHashSet::default();
+
+  for chunk in user_ids.chunks(CHUNK_SIZE) {
+    let mut qb = QueryBuilder::new("SELECT osu_id FROM users WHERE osu_id IN ");
+    qb.push_tuples(chunk, |mut b, &osu_id| {
+      b.push_bind(osu_id as i64);
+    });
+    let query = qb.build();
+
+    let res: Vec<MySqlRow> = query.fetch_all(db_pool()).await?;
+    existing_user_ids.extend(
+      res
+        .into_iter()
+        .map(|row| sqlx::Row::get::<i64, _>(&row, 0usize) as usize),
+    );
+  }
+
   let missing_user_ids: Vec<usize> = all_user_ids
     .difference(&existing_user_ids)
     .copied()
