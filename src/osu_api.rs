@@ -34,7 +34,7 @@ pub struct HiscoreV1 {
 
 pub type GetHiscoresV2Response = Vec<HiscoreV2>;
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct HiscoreV2 {
   pub mods: Vec<Mod>,
   pub statistics: Statistics,
@@ -59,8 +59,28 @@ pub struct HiscoreV2 {
   pub started_at: Option<String>,
   pub total_score: i64,
   pub replay: bool,
+  #[serde(skip_serializing)]
   pub beatmap: Beatmap,
+  #[serde(skip_serializing)]
   pub user: User,
+}
+
+impl HiscoreV2 {
+  /// Builds the pkey used by the `beatmap_difficulties` table
+  pub fn build_score_id(&self) -> String {
+    let order = ["DT", "EZ", "FL", "HR", "HT"];
+
+    let mut combined_mods = String::new();
+    for m in order {
+      for acronym in &self.mods {
+        if acronym.acronym == m {
+          combined_mods.push_str(m);
+        }
+      }
+    }
+
+    format!("{}_{}", self.beatmap_id, combined_mods)
+  }
 }
 
 fn unacronym_mods<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -217,7 +237,41 @@ pub struct Beatmap {
   pub beatmapset: Option<Beatmapset>,
 }
 
-#[derive(Deserialize, PartialEq, Debug)]
+#[derive(sqlx::FromRow, Serialize)]
+pub struct OsutrackDbBeatmap {
+  pub beatmapset_id: i64,
+  pub beatmap_id: i64,
+  pub approved: i64,
+  pub approved_date: Option<chrono::NaiveDateTime>,
+  pub last_update: chrono::NaiveDateTime,
+  pub total_length: i64,
+  pub hit_length: i64,
+  pub version: String,
+  pub artist: String,
+  pub title: String,
+  pub creator: String,
+  pub bpm: i64,
+  pub source: String,
+  pub difficultyrating: f64,
+  pub diff_size: f64,
+  pub diff_overall: f64,
+  pub diff_approach: f64,
+  pub diff_drain: f64,
+  pub mode: i64,
+}
+
+#[derive(Clone, sqlx::FromRow, Serialize)]
+pub struct BeatmapDifficulties {
+  pub score_id: String,
+  pub difficulty_aim: f64,
+  pub difficulty_speed: f64,
+  pub difficulty_flashlight: f64,
+  pub speed_note_count: f64,
+  pub slider_factor: f64,
+  pub stars: f64,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
 pub struct User {
   pub id: u64,
   pub username: String,
@@ -485,7 +539,7 @@ pub mod daily_challenge {
 
   use super::Beatmap;
 
-  #[derive(Deserialize)]
+  #[derive(Serialize, Deserialize)]
   pub struct DailyChallengeScore {
     pub preserve: bool,
     pub processed: bool,
@@ -544,15 +598,15 @@ pub mod daily_challenge {
 
   #[derive(Deserialize)]
   struct DifficultyRange {
-    min: f32,
-    max: f32,
+    // min: f32,
+    // max: f32,
   }
 
   #[derive(Deserialize)]
   struct Room {
     pub id: i64,
     pub current_playlist_item: CurrentPlaylistItem,
-    pub difficulty_range: DifficultyRange,
+    // pub difficulty_range: DifficultyRange,
     pub starts_at: chrono::DateTime<chrono::Utc>,
   }
 

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use foundations::{
   cli::{Arg, ArgAction, Cli},
-  telemetry::{init_with_server, tokio_runtime_metrics::record_runtime_metrics_sample},
+  telemetry::{self, tokio_runtime_metrics::record_runtime_metrics_sample, TelemetryConfig},
   BootstrapResult,
 };
 use server::start_server;
@@ -39,7 +39,11 @@ async fn start() -> BootstrapResult<()> {
   }
 
   // Initialize telemetry with the settings obtained from the config.
-  let tele_serv_fut = init_with_server(&service_info, &cli.settings.telemetry, vec![])?;
+  let tele_serv_fut = telemetry::init(TelemetryConfig {
+    service_info: &service_info,
+    settings: &cli.settings.telemetry,
+    custom_server_routes: vec![],
+  })?;
   if let Some(tele_serv_addr) = tele_serv_fut.server_addr() {
     info!("Telemetry server is listening on http://{}", tele_serv_addr);
     tokio::task::spawn(tele_serv_fut);
