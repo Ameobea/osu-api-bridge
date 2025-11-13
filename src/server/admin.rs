@@ -1,6 +1,8 @@
 use std::time::Duration;
 
+use axum::extract::Query;
 use reqwest::StatusCode;
+use serde::Deserialize;
 
 use crate::{db::db_pool, osu_api::fetch_username};
 
@@ -163,5 +165,86 @@ pub(super) async fn verify_best_plays(admin_api_token: String) -> Result<(), API
   }
 
   info!("Done verifying top plays");
+  Ok(())
+}
+
+#[derive(Deserialize)]
+pub(super) struct UndeleteUserQueryParams {
+  user_id: i64,
+}
+
+pub(super) async fn maybe_undelete_user(
+  Query(UndeleteUserQueryParams { user_id }): Query<UndeleteUserQueryParams>,
+  admin_api_token: String,
+) -> Result<(), APIError> {
+  validate_admin_api_token(&admin_api_token)?;
+
+  let pool = db_pool();
+  let mut txn = pool.begin().await.map_err(|err| {
+    error!("Error starting transaction: {err}");
+    APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: "Error starting transaction".to_owned(),
+    }
+  })?;
+
+  match fetch_username(user_id as u64).await {
+    Ok(Some(_username)) => {},
+    Ok(None) => {
+      return Err(APIError {
+        status: StatusCode::BAD_REQUEST,
+        message: "Cannot undelete user that does not exist in osu! API".to_owned(),
+      });
+    },
+    Err(err) => {
+      error!("Error fetching username from osu! API for user ID {user_id}; err={err:?}");
+      return Err(APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: "Error fetching username from osu! API".to_owned(),
+      });
+    },
+  };
+
+  sqlx::query(
+    "INSERT IGNORE INTO hiscore_updates (user, beatmap_id, score, pp, mods, rank, score_time, \
+     update_time, mode, is_classic) SELECT user, beatmap_id, score, pp, mods, rank, score_time, \
+     update_time, mode, is_classic FROM hiscore_updates_deleted WHERE user = ?;",
+  )
+  .bind(user_id)
+  .execute(&mut *txn)
+  .await
+  .map_err(|err| {
+    error!("Error restoring hiscore updates from hiscore_updates_deleted: {err}");
+    APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: "Error restoring hiscore updates from hiscore_updates_deleted".to_owned(),
+    }
+  })?;
+
+  sqlx::query(
+    "INSERT IGNORE INTO updates (user, count300, count100, count50, playcount, ranked_score, \
+     total_score, pp_rank, level, pp_raw, accuracy, count_rank_ss, count_rank_s, count_rank_a, \
+     timestamp, mode) SELECT user, count300, count100, count50, playcount, ranked_score, \
+     total_score, pp_rank, level, pp_raw, accuracy, count_rank_ss, count_rank_s, count_rank_a, \
+     timestamp, mode FROM updates_deleted WHERE user = ?;",
+  )
+  .bind(user_id)
+  .execute(&mut *txn)
+  .await
+  .map_err(|err| {
+    error!("Error restoring updates from updates_deleted: {err}");
+    APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: "Error restoring updates from updates_deleted".to_owned(),
+    }
+  })?;
+
+  txn.commit().await.map_err(|err| {
+    error!("Error committing transaction to restore user hiscores + updates: {err}");
+    APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: "Error committing transaction to restore user hiscores + updates".to_owned(),
+    }
+  })?;
   Ok(())
 }

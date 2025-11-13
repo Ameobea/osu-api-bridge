@@ -9,7 +9,7 @@ use dashmap::DashMap;
 use rosu_pp::{any::DifficultyAttributes, Beatmap, Performance};
 use rosu_v2::model::mods::GameModsLegacy;
 use serde::Serialize;
-use tokio::{sync::Semaphore, task::JoinSet};
+use tokio::sync::Semaphore;
 
 use super::*;
 use crate::db::db_pool;
@@ -44,8 +44,11 @@ async fn download_beatmap(beatmap_id: i32) -> Result<Vec<u8>, APIError> {
   const MAX_RETRIES: u32 = 5;
   const BACKOFF_MS: u64 = 1000;
 
+  let _permit = DOWNLOAD_SEMAPHORE.acquire().await.unwrap();
+
   for attempt in 0..MAX_RETRIES {
     let url = format!("https://osu.ppy.sh/osu/{beatmap_id}");
+    info!("Downloading beatmap {beatmap_id} from osu...");
     let resp = reqwest::get(&url).await.map_err(|err| {
       error!(
         "Error fetching beatmap {beatmap_id} (attempt {}): {err}",
@@ -58,6 +61,7 @@ async fn download_beatmap(beatmap_id: i32) -> Result<Vec<u8>, APIError> {
     })?;
 
     if resp.status().is_success() {
+      info!("Successfully downloaded beatmap {beatmap_id}");
       let raw_beatmap = resp.bytes().await.unwrap();
       return Ok(raw_beatmap.to_vec());
     } else if attempt < MAX_RETRIES - 1 {
@@ -99,6 +103,53 @@ lazy_static::lazy_static! {
   static ref DOWNLOAD_SEMAPHORE: Semaphore = Semaphore::new(1);
 }
 
+fn decompress_and_parse_beatmap(
+  beatmap_id: u64,
+  raw_beatmap_gzipped: &[u8],
+) -> Result<Arc<Beatmap>, APIError> {
+  let mut decoder = flate2::read::GzDecoder::new(raw_beatmap_gzipped);
+  let mut decompressed = Vec::new();
+  decoder
+    .read_to_end(&mut decompressed)
+    .map_err(|err| APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: format!("Error decompressing beatmap {beatmap_id}: {err}"),
+    })?;
+
+  let beatmap = Beatmap::from_bytes(&decompressed).map_err(|err| APIError {
+    status: StatusCode::INTERNAL_SERVER_ERROR,
+    message: format!("Error parsing beatmap {beatmap_id}: {err}"),
+  })?;
+  let beatmap = Arc::new(beatmap);
+  BEATMAP_CACHE.insert(beatmap_id, Arc::clone(&beatmap));
+  Ok(beatmap)
+}
+
+async fn fetch_beatmaps_from_db(beatmap_ids: &[u64]) -> Result<Vec<(i64, Vec<u8>)>, APIError> {
+  let placeholders = beatmap_ids
+    .iter()
+    .map(|_| "?")
+    .collect::<Vec<_>>()
+    .join(",");
+  let query_str = format!(
+    "SELECT beatmap_id, raw_beatmap_gzipped FROM fetched_beatmaps WHERE beatmap_id IN ({})",
+    placeholders
+  );
+
+  let mut query = sqlx::query_as::<_, (i64, Vec<u8>)>(&query_str);
+  for &id in beatmap_ids {
+    query = query.bind(id as i64);
+  }
+
+  query.fetch_all(db_pool()).await.map_err(|err| {
+    error!("Error fetching beatmaps from DB: {err}");
+    APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: format!("Error fetching beatmaps from DB: {err}"),
+    }
+  })
+}
+
 async fn fetch_beatmap(beatmap_id: u64) -> Result<Arc<Beatmap>, APIError> {
   if let Some(beatmap) = BEATMAP_CACHE.get(&beatmap_id) {
     return Ok(Arc::clone(&beatmap));
@@ -121,25 +172,10 @@ async fn fetch_beatmap(beatmap_id: u64) -> Result<Arc<Beatmap>, APIError> {
     return Ok(beatmap);
   };
 
-  let mut decoder = flate2::read::GzDecoder::new(&beatmap[..]);
-  let mut decompressed = Vec::new();
-  decoder
-    .read_to_end(&mut decompressed)
-    .map_err(|err| APIError {
-      status: StatusCode::INTERNAL_SERVER_ERROR,
-      message: format!("Error decompressing beatmap: {err}"),
-    })?;
-
-  let beatmap = Beatmap::from_bytes(&decompressed).map_err(|err| APIError {
-    status: StatusCode::INTERNAL_SERVER_ERROR,
-    message: format!("Error parsing beatmap: {err}"),
-  })?;
-  let beatmap = Arc::new(beatmap);
-  BEATMAP_CACHE.insert(beatmap_id, Arc::clone(&beatmap));
-  Ok(beatmap)
+  decompress_and_parse_beatmap(beatmap_id, &beatmap)
 }
 
-pub(super) async fn fetch_multiple_beatmaps(beatmap_ids: &[u64]) -> Vec<Option<Arc<Beatmap>>> {
+pub(super) async fn fetch_beatmaps_cached_only(beatmap_ids: &[u64]) -> Vec<Option<Arc<Beatmap>>> {
   let mut results: FxHashMap<u64, Option<Arc<Beatmap>>> = FxHashMap::default();
   let mut missing_ids = Vec::new();
 
@@ -158,93 +194,25 @@ pub(super) async fn fetch_multiple_beatmaps(beatmap_ids: &[u64]) -> Vec<Option<A
       .collect();
   }
 
-  let placeholders = missing_ids
-    .iter()
-    .map(|_| "?")
-    .collect::<Vec<_>>()
-    .join(",");
-  let query_str = format!(
-    "SELECT beatmap_id, raw_beatmap_gzipped FROM fetched_beatmaps WHERE beatmap_id IN ({})",
-    placeholders
-  );
+  let db_results = fetch_beatmaps_from_db(&missing_ids)
+    .await
+    .unwrap_or_else(|_| Vec::new());
 
-  let mut query = sqlx::query_as::<_, (i64, Vec<u8>)>(&query_str);
-  for &id in &missing_ids {
-    query = query.bind(id as i64);
-  }
-
-  let db_results = match query.fetch_all(db_pool()).await {
-    Ok(results) => results,
-    Err(err) => {
-      error!("Error fetching beatmaps from DB: {err}");
-      Vec::new()
-    },
-  };
-
-  let mut still_missing_ids = Vec::new();
   for &beatmap_id in &missing_ids {
     if let Some((_, raw_beatmap_gzipped)) =
       db_results.iter().find(|(id, _)| *id == beatmap_id as i64)
     {
-      let mut decoder = flate2::read::GzDecoder::new(&raw_beatmap_gzipped[..]);
-      let mut decompressed = Vec::new();
-      if let Err(err) = decoder.read_to_end(&mut decompressed) {
-        error!("Error decompressing beatmap {beatmap_id}: {err}");
-        results.insert(beatmap_id, None);
-        continue;
-      }
-
-      match Beatmap::from_bytes(&decompressed) {
+      match decompress_and_parse_beatmap(beatmap_id, raw_beatmap_gzipped) {
         Ok(beatmap) => {
-          let beatmap = Arc::new(beatmap);
-          BEATMAP_CACHE.insert(beatmap_id, Arc::clone(&beatmap));
           results.insert(beatmap_id, Some(beatmap));
         },
         Err(err) => {
-          error!("Error parsing beatmap {beatmap_id}: {err}");
+          error!("Error processing beatmap {beatmap_id}: {}", err.message);
           results.insert(beatmap_id, None);
         },
       }
     } else {
-      still_missing_ids.push(beatmap_id);
-    }
-  }
-
-  let mut download_tasks = JoinSet::new();
-
-  for beatmap_id in still_missing_ids {
-    download_tasks.spawn(async move {
-      let _permit = DOWNLOAD_SEMAPHORE.acquire().await.unwrap();
-
-      let raw_beatmap = match download_beatmap(beatmap_id as i32).await {
-        Ok(data) => data,
-        Err(err) => {
-          error!("Failed to download beatmap {beatmap_id}: {}", err.message);
-          return (beatmap_id, None);
-        },
-      };
-
-      if let Err(err) = compress_and_insert_beatmap(beatmap_id as i32, &raw_beatmap).await {
-        error!("Failed to store beatmap {beatmap_id}: {}", err.message);
-      }
-
-      match Beatmap::from_bytes(&raw_beatmap) {
-        Ok(beatmap) => {
-          let beatmap = Arc::new(beatmap);
-          BEATMAP_CACHE.insert(beatmap_id, Arc::clone(&beatmap));
-          (beatmap_id, Some(beatmap))
-        },
-        Err(err) => {
-          error!("Error parsing downloaded beatmap {beatmap_id}: {err}");
-          (beatmap_id, None)
-        },
-      }
-    });
-  }
-
-  while let Some(result) = download_tasks.join_next().await {
-    if let Ok((beatmap_id, beatmap_opt)) = result {
-      results.insert(beatmap_id, beatmap_opt);
+      results.insert(beatmap_id, None);
     }
   }
 
@@ -252,6 +220,31 @@ pub(super) async fn fetch_multiple_beatmaps(beatmap_ids: &[u64]) -> Vec<Option<A
     .iter()
     .map(|id| results.get(id).and_then(|opt| opt.clone()))
     .collect()
+}
+
+pub(super) async fn fetch_and_store_beatmap(beatmap_id: u64) -> Result<Arc<Beatmap>, APIError> {
+  if let Some(beatmap) = BEATMAP_CACHE.get(&beatmap_id) {
+    return Ok(Arc::clone(&beatmap));
+  }
+
+  let db_result = sqlx::query_scalar!(
+    "SELECT raw_beatmap_gzipped FROM fetched_beatmaps WHERE beatmap_id = ?",
+    beatmap_id
+  )
+  .fetch_optional(db_pool())
+  .await
+  .map_err(|err| APIError {
+    status: StatusCode::INTERNAL_SERVER_ERROR,
+    message: format!("Error fetching beatmap: {err}"),
+  })?;
+
+  if let Some(raw_beatmap_gzipped) = db_result {
+    return decompress_and_parse_beatmap(beatmap_id, &raw_beatmap_gzipped);
+  }
+
+  let beatmap = Arc::new(download_and_store_beatmap(beatmap_id).await?);
+  BEATMAP_CACHE.insert(beatmap_id, Arc::clone(&beatmap));
+  Ok(beatmap)
 }
 
 fn compute_diff_attrs(

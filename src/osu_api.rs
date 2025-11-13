@@ -277,6 +277,7 @@ pub struct User {
   pub username: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Ruleset {
   Osu,
   Taiko,

@@ -21,6 +21,7 @@ use fxhash::FxHashMap;
 use rosu_mods::{GameMod, GameMods};
 use rosu_pp::{
   any::{DifficultyAttributes, PerformanceAttributes},
+  model::beatmap::BeatmapAttributesBuilder,
   osu::OsuDifficultyAttributes,
   Beatmap, Difficulty, Performance,
 };
@@ -39,7 +40,6 @@ use crate::{
     fetch_user_hiscores, BeatmapDifficulties, HiscoreV1, HiscoreV2, OsutrackDbBeatmap, Ruleset,
     UserScoreOnBeatmap,
   },
-  server::simulate_play::fetch_multiple_beatmaps,
   settings::ServerSettings,
 };
 
@@ -87,12 +87,19 @@ async fn get_hiscores(
   Ok(Json(hiscores_v1))
 }
 
+#[derive(Clone, Serialize)]
+struct PerfAttrs {
+  pub earned: OsuPerformanceAttributes,
+  pub max: OsuPerformanceAttributes,
+}
+
 #[derive(Serialize)]
 struct GetHiscoresV2Response {
   pub hiscores: Vec<HiscoreV2>,
   pub beatmaps: FxHashMap<u64, OsutrackDbBeatmap>,
   pub difficulties: FxHashMap<u64, BeatmapDifficulties>,
-  pub performance_attrs: FxHashMap<i64, OsuPerformanceAttributes>,
+  pub performance_attrs: FxHashMap<i64, PerfAttrs>,
+  pub attrs_with_mods: FxHashMap<u64, BeatmapAttrs>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -134,14 +141,17 @@ struct DifficultyPerfCacheKey {
   is_classic: bool,
 }
 
-#[derive(Clone)]
-struct DifficultyPerfCacheValue {
-  difficulty: OsuDifficultyAttributes,
-  performance: OsuPerformanceAttributes,
+#[derive(Clone, Serialize)]
+pub struct BeatmapAttrs {
+  pub cs: f64,
+  pub ar: f64,
+  pub od: f64,
+  pub hp: f64,
+  pub clock_rate: f64,
 }
 
 lazy_static::lazy_static! {
-  static ref DIFFICULTY_PERF_CACHE: DashMap<DifficultyPerfCacheKey, Arc<DifficultyPerfCacheValue>> = DashMap::new();
+  static ref DIFFICULTY_PERF_CACHE: DashMap<DifficultyPerfCacheKey, OsuDifficultyAttributes> = DashMap::new();
 }
 
 fn mods_to_string(mods: &GameMods) -> String {
@@ -152,10 +162,12 @@ fn mods_to_string(mods: &GameMods) -> String {
 
 async fn compute_beatmap_difficulties(
   hiscores: &[HiscoreV2],
+  beatmap_metadata: &FxHashMap<u64, OsutrackDbBeatmap>,
 ) -> Result<
   (
     Vec<Option<BeatmapDifficulties>>,
-    Vec<Option<OsuPerformanceAttributes>>,
+    Vec<Option<BeatmapAttrs>>,
+    Vec<Option<PerfAttrs>>,
   ),
   APIError,
 > {
@@ -163,18 +175,34 @@ async fn compute_beatmap_difficulties(
     .iter()
     .map(|hiscore| hiscore.beatmap_id as u64)
     .collect();
-  let beatmaps: Vec<Option<Arc<Beatmap>>> = fetch_multiple_beatmaps(&beatmap_ids).await;
+
+  let beatmaps: Vec<Option<Arc<Beatmap>>> =
+    simulate_play::fetch_beatmaps_cached_only(&beatmap_ids).await;
+
+  let missing_ids: Vec<u64> = beatmap_ids
+    .iter()
+    .zip(&beatmaps)
+    .filter_map(|(&id, beatmap)| if beatmap.is_none() { Some(id) } else { None })
+    .collect();
+
+  if !missing_ids.is_empty() {
+    tokio::spawn(async move {
+      for beatmap_id in missing_ids {
+        if let Err(err) = simulate_play::fetch_and_store_beatmap(beatmap_id).await {
+          warn!(
+            "Failed to fetch beatmap {beatmap_id} in background: {}",
+            err.message
+          );
+        }
+      }
+    });
+  }
 
   let mut diffs = Vec::with_capacity(hiscores.len());
+  let mut attrs = Vec::with_capacity(hiscores.len());
   let mut perfs = Vec::with_capacity(hiscores.len());
 
   for (beatmap_opt, hiscore) in beatmaps.iter().zip(hiscores.iter()) {
-    let Some(beatmap) = beatmap_opt else {
-      diffs.push(None);
-      perfs.push(None);
-      continue;
-    };
-
     let mut mods = GameMods::default();
     let mut is_classic = false;
     for m in &hiscore.mods {
@@ -197,39 +225,67 @@ async fn compute_beatmap_difficulties(
         "TC" => mods.insert(GameMod::TraceableOsu(Default::default())),
         "BL" => mods.insert(GameMod::BlindsOsu(Default::default())),
         "NS" => mods.insert(GameMod::NoScopeOsu(Default::default())),
+        "2K" => mods.insert(GameMod::TwoKeysMania(Default::default())),
+        "3K" => mods.insert(GameMod::ThreeKeysMania(Default::default())),
+        "4K" => mods.insert(GameMod::FourKeysMania(Default::default())),
+        "5K" => mods.insert(GameMod::FiveKeysMania(Default::default())),
+        "6K" => mods.insert(GameMod::SixKeysMania(Default::default())),
+        "7K" => mods.insert(GameMod::SevenKeysMania(Default::default())),
         "CL" => is_classic = true,
         _ => warn!("Unhandled mod acronym in ranked score: {}", m.acronym),
       }
     }
+
+    let Some(beatmap_meta) = beatmap_metadata.get(&(hiscore.beatmap_id as u64)) else {
+      warn!("Missing beatmap metadata for {}", hiscore.beatmap_id);
+      diffs.push(None);
+      attrs.push(None);
+      perfs.push(None);
+      continue;
+    };
+
+    let attrs_with_mods = BeatmapAttributesBuilder::new()
+      .ar(beatmap_meta.diff_approach as f32, false)
+      .cs(beatmap_meta.diff_size as f32, false)
+      .od(beatmap_meta.diff_overall as f32, false)
+      .hp(beatmap_meta.diff_drain as f32, false)
+      .mods(mods.clone())
+      .build();
+    let attrs_with_mods = BeatmapAttrs {
+      cs: attrs_with_mods.cs,
+      ar: attrs_with_mods.ar,
+      od: attrs_with_mods.od,
+      hp: attrs_with_mods.hp,
+      clock_rate: attrs_with_mods.clock_rate,
+    };
+    attrs.push(Some(attrs_with_mods));
 
     let cache_key = DifficultyPerfCacheKey {
       beatmap_id: hiscore.beatmap_id as u64,
       mods_string: mods_to_string(&mods),
       is_classic,
     };
+    let diff = match DIFFICULTY_PERF_CACHE.get(&cache_key) {
+      Some(cached) => cached.clone(),
+      None => {
+        let diff = Difficulty::new().mods(mods.clone()).lazer(!is_classic);
 
-    if let Some(cached) = DIFFICULTY_PERF_CACHE.get(&cache_key) {
-      diffs.push(Some(BeatmapDifficulties {
-        score_id: hiscore.build_score_id(),
-        difficulty_aim: cached.difficulty.aim,
-        difficulty_speed: cached.difficulty.speed,
-        difficulty_flashlight: cached.difficulty.flashlight,
-        speed_note_count: cached.difficulty.speed_note_count,
-        slider_factor: cached.difficulty.slider_factor,
-        stars: cached.difficulty.stars,
-      }));
-      perfs.push(Some(cached.performance.clone()));
-      continue;
-    }
+        let Some(beatmap) = beatmap_opt else {
+          diffs.push(None);
+          perfs.push(None);
+          continue;
+        };
 
-    let diff = Difficulty::new()
-      .mods(mods.clone())
-      .lazer(!is_classic)
-      .calculate(&beatmap);
-    let DifficultyAttributes::Osu(diff) = diff else {
-      diffs.push(None);
-      perfs.push(None);
-      continue;
+        let diff = diff.calculate(&beatmap);
+        let DifficultyAttributes::Osu(diff) = diff else {
+          diffs.push(None);
+          perfs.push(None);
+          continue;
+        };
+
+        DIFFICULTY_PERF_CACHE.insert(cache_key, diff.clone());
+        diff
+      },
     };
 
     diffs.push(Some(BeatmapDifficulties {
@@ -243,7 +299,7 @@ async fn compute_beatmap_difficulties(
     }));
 
     let perf = Performance::new(diff.clone())
-      .mods(mods)
+      .mods(mods.clone())
       .lazer(!is_classic)
       .combo(hiscore.max_combo as _)
       .misses(hiscore.statistics.miss.unwrap_or(0) as _)
@@ -257,18 +313,29 @@ async fn compute_beatmap_difficulties(
       continue;
     };
 
-    let perf_attrs = OsuPerformanceAttributes::from(perf);
-    perfs.push(Some(perf_attrs.clone()));
+    let earned_attrs = OsuPerformanceAttributes::from(perf);
 
-    // Store in cache
-    let cache_value = Arc::new(DifficultyPerfCacheValue {
-      difficulty: diff,
-      performance: perf_attrs,
-    });
-    DIFFICULTY_PERF_CACHE.insert(cache_key, cache_value);
+    let perf = Performance::new(diff.clone())
+      .mods(mods)
+      .lazer(!is_classic)
+      .accuracy(100.);
+    let perf = perf.calculate();
+    let PerformanceAttributes::Osu(perf) = perf else {
+      perfs.push(None);
+      continue;
+    };
+
+    let max_attrs = OsuPerformanceAttributes::from(perf);
+
+    let perf_attrs = PerfAttrs {
+      earned: earned_attrs,
+      max: max_attrs,
+    };
+
+    perfs.push(Some(perf_attrs.clone()));
   }
 
-  Ok((diffs, perfs))
+  Ok((diffs, attrs, perfs))
 }
 
 async fn get_hiscores_v2(
@@ -287,51 +354,58 @@ async fn get_hiscores_v2(
     .collect::<Vec<_>>()
     .join(",");
 
-  let beatmaps_fut = async move {
-    let query = format!(
-      "SELECT beatmapset_id,beatmap_id,approved,approved_date,last_update,total_length,hit_length,\
-       version,artist,title,creator,bpm,source,difficultyrating,diff_size,diff_overall,\
-       diff_approach,diff_drain,mode FROM beatmaps WHERE beatmap_id IN ({})",
-      beatmap_ids_string
-    );
-    let query = sqlx::query_as::<_, OsutrackDbBeatmap>(&query);
-    query
-      .fetch_all(crate::db::db_pool())
-      .await
-      .map_err(|err| APIError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: format!("Error fetching beatmaps from DB: {err}"),
-      })
-      .map(|beatmaps| {
-        beatmaps
-          .into_iter()
-          .map(|bm| (bm.beatmap_id as u64, bm))
-          .collect::<FxHashMap<u64, OsutrackDbBeatmap>>()
-      })
-  };
+  let query = format!(
+    "SELECT beatmapset_id,beatmap_id,approved,approved_date,last_update,total_length,hit_length,\
+     version,artist,title,creator,bpm,source,difficultyrating,diff_size,diff_overall,\
+     diff_approach,diff_drain,mode FROM beatmaps WHERE beatmap_id IN ({})",
+    beatmap_ids_string
+  );
+  let query = sqlx::query_as::<_, OsutrackDbBeatmap>(&query);
+  let beatmaps_meta = query
+    .fetch_all(crate::db::db_pool())
+    .await
+    .map_err(|err| APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: format!("Error fetching beatmaps from DB: {err}"),
+    })?;
+  let beatmaps_meta = beatmaps_meta
+    .into_iter()
+    .map(|bm| (bm.beatmap_id as u64, bm))
+    .collect::<FxHashMap<u64, OsutrackDbBeatmap>>();
 
-  let difficulties_fut = compute_beatmap_difficulties(&hiscores_v2);
-
-  let (beatmaps, (difficulties, performance_attrs)) =
-    tokio::try_join!(beatmaps_fut, difficulties_fut)?;
+  let (difficulties, attrs_with_mods, performance_attrs) =
+    compute_beatmap_difficulties(&hiscores_v2, &beatmaps_meta).await?;
 
   let mut difficulties_by_beatmap_id: FxHashMap<u64, BeatmapDifficulties> = FxHashMap::default();
-  let mut performance_attrs_by_score_id: FxHashMap<i64, OsuPerformanceAttributes> =
-    FxHashMap::default();
+  let mut performance_attrs_by_score_id: FxHashMap<i64, PerfAttrs> = FxHashMap::default();
 
-  for (i, hiscore) in hiscores_v2.iter().enumerate() {
-    if let Some(diff) = &difficulties[i] {
-      difficulties_by_beatmap_id.insert(hiscore.beatmap_id as u64, diff.clone());
-    }
-    if let Some(perf) = &performance_attrs[i] {
-      performance_attrs_by_score_id.insert(hiscore.id, perf.clone());
+  // TODO: would have to handle mode-specific difficulties later
+  if params.mode == Ruleset::Osu {
+    for (i, hiscore) in hiscores_v2.iter().enumerate() {
+      if let Some(diff) = &difficulties[i] {
+        difficulties_by_beatmap_id.insert(hiscore.beatmap_id as u64, diff.clone());
+      }
+      if let Some(perf) = &performance_attrs[i] {
+        performance_attrs_by_score_id.insert(hiscore.id, perf.clone());
+      }
     }
   }
 
+  let attrs_with_mods: FxHashMap<u64, BeatmapAttrs> = hiscores_v2
+    .iter()
+    .enumerate()
+    .filter_map(|(i, hiscore)| {
+      attrs_with_mods[i]
+        .as_ref()
+        .map(|attrs| (hiscore.beatmap_id as u64, attrs.clone()))
+    })
+    .collect();
+
   Ok(Json(GetHiscoresV2Response {
     hiscores: hiscores_v2,
-    beatmaps,
+    beatmaps: beatmaps_meta,
     difficulties: difficulties_by_beatmap_id,
+    attrs_with_mods,
     performance_attrs: performance_attrs_by_score_id,
   }))
 }
@@ -697,13 +771,21 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
 
   #[cfg(feature = "sql")]
   {
-    router = router.route(
-      "/verify-best-plays",
-      axum::routing::post(instrument_handler(
-        "verify_best_plays",
-        admin::verify_best_plays,
-      )),
-    );
+    router = router
+      .route(
+        "/verify-best-plays",
+        axum::routing::post(instrument_handler(
+          "verify_best_plays",
+          admin::verify_best_plays,
+        )),
+      )
+      .route(
+        "/maybe-undelete-user",
+        axum::routing::post(instrument_handler(
+          "maybe_undelete_user",
+          admin::maybe_undelete_user,
+        )),
+      );
   }
 
   router = router

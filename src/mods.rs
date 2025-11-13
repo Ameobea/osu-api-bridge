@@ -12,7 +12,7 @@ pub fn build_mods_bitmap(mods: &[Mod]) -> u32 {
       "SD" => 1 << 5,
       "DT" => 1 << 6,
       "RX" => 1 << 7,
-      "HT" => 1 << 8,
+      "HT" | "DC" => 1 << 8,
       // NC also applies DT's bit
       "NC" => (1 << 9) | (1 << 6),
       "FL" => 1 << 10,
@@ -38,6 +38,12 @@ pub fn build_mods_bitmap(mods: &[Mod]) -> u32 {
       "V2" => 1 << 29,
       "MR" => 1 << 30,
       "CL" => 0,
+      // Lazer-only and no impact on scores, so can be ignored
+      "MU" | "AC" => 0,
+      "TC" => {
+        // Lazer-only; doesn't exist in the bitmap
+        0
+      },
       _ => {
         error!("Unknown mod: {}", m.acronym);
         0
