@@ -1,12 +1,23 @@
 use std::{
   io::{Read, Write},
   str::FromStr,
-  sync::Arc,
+  sync::{
+    atomic::{AtomicI64, Ordering},
+    Arc,
+  },
   time::Duration,
 };
 
-use dashmap::DashMap;
-use rosu_pp::{any::DifficultyAttributes, Beatmap, Performance};
+use moka::sync::Cache;
+use rosu_pp::{
+  any::DifficultyAttributes,
+  model::{
+    beatmap::BreakPeriod,
+    control_point::{DifficultyPoint, EffectPoint, TimingPoint},
+    hit_object::{HitObject, HitSoundType},
+  },
+  Beatmap, Performance,
+};
 use rosu_v2::model::mods::GameModsLegacy;
 use serde::Serialize;
 use tokio::sync::Semaphore;
@@ -49,6 +60,10 @@ async fn download_beatmap(beatmap_id: i32) -> Result<Vec<u8>, APIError> {
   for attempt in 0..MAX_RETRIES {
     let url = format!("https://osu.ppy.sh/osu/{beatmap_id}");
     info!("Downloading beatmap {beatmap_id} from osu...");
+
+    let _timer =
+      crate::metrics::http_server::beatmap_download_response_time_seconds().start_timer();
+
     let resp = reqwest::get(&url).await.map_err(|err| {
       error!(
         "Error fetching beatmap {beatmap_id} (attempt {}): {err}",
@@ -99,8 +114,55 @@ async fn download_and_store_beatmap(beatmap_id: u64) -> Result<Beatmap, APIError
 }
 
 lazy_static::lazy_static! {
-  static ref BEATMAP_CACHE: DashMap<u64, Arc<Beatmap>> = DashMap::new();
+  static ref BEATMAP_CACHE_BYTES: AtomicI64 = AtomicI64::new(0);
+  static ref BEATMAP_CACHE: Cache<u64, Arc<Beatmap>> = Cache::builder()
+    .max_capacity(10_000)
+    .eviction_listener(|_key: Arc<u64>, val: Arc<Beatmap>, _cause| {
+      let bytes = estimate_beatmap_size(&val);
+      let new_total = BEATMAP_CACHE_BYTES.fetch_sub(bytes, Ordering::Relaxed) - bytes;
+      crate::metrics::http_server::beatmap_cache_bytes().set(new_total as u64);
+    })
+    .build();
   static ref DOWNLOAD_SEMAPHORE: Semaphore = Semaphore::new(1);
+}
+
+fn estimate_beatmap_size(beatmap: &Beatmap) -> i64 {
+  let base_size = std::mem::size_of::<Beatmap>() as i64;
+
+  let breaks_size = (beatmap.breaks.capacity() * std::mem::size_of::<BreakPeriod>()) as i64;
+  let timing_points_size =
+    (beatmap.timing_points.capacity() * std::mem::size_of::<TimingPoint>()) as i64;
+  let difficulty_points_size =
+    (beatmap.difficulty_points.capacity() * std::mem::size_of::<DifficultyPoint>()) as i64;
+  let effect_points_size =
+    (beatmap.effect_points.capacity() * std::mem::size_of::<EffectPoint>()) as i64;
+  let hit_objects_size = (beatmap.hit_objects.capacity() * std::mem::size_of::<HitObject>()) as i64;
+  let hit_sounds_size =
+    (beatmap.hit_sounds.capacity() * std::mem::size_of::<HitSoundType>()) as i64;
+
+  base_size
+    + breaks_size
+    + timing_points_size
+    + difficulty_points_size
+    + effect_points_size
+    + hit_objects_size
+    + hit_sounds_size
+}
+
+fn insert_beatmap_into_cache(beatmap_id: u64, mut beatmap: Beatmap) -> Arc<Beatmap> {
+  beatmap.breaks.shrink_to_fit();
+  beatmap.timing_points.shrink_to_fit();
+  beatmap.difficulty_points.shrink_to_fit();
+  beatmap.effect_points.shrink_to_fit();
+  beatmap.hit_objects.shrink_to_fit();
+  beatmap.hit_sounds.shrink_to_fit();
+
+  let beatmap = Arc::new(beatmap);
+  let bytes = estimate_beatmap_size(&beatmap);
+  BEATMAP_CACHE.insert(beatmap_id, Arc::clone(&beatmap));
+  let new_total = BEATMAP_CACHE_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
+  crate::metrics::http_server::beatmap_cache_bytes().set(new_total as u64);
+  beatmap
 }
 
 fn decompress_and_parse_beatmap(
@@ -120,9 +182,8 @@ fn decompress_and_parse_beatmap(
     status: StatusCode::INTERNAL_SERVER_ERROR,
     message: format!("Error parsing beatmap {beatmap_id}: {err}"),
   })?;
-  let beatmap = Arc::new(beatmap);
-  BEATMAP_CACHE.insert(beatmap_id, Arc::clone(&beatmap));
-  Ok(beatmap)
+
+  Ok(insert_beatmap_into_cache(beatmap_id, beatmap))
 }
 
 async fn fetch_beatmaps_from_db(beatmap_ids: &[u64]) -> Result<Vec<(i64, Vec<u8>)>, APIError> {
@@ -167,9 +228,8 @@ async fn fetch_beatmap(beatmap_id: u64) -> Result<Arc<Beatmap>, APIError> {
   })?;
 
   let Some(beatmap) = beatmap else {
-    let beatmap = Arc::new(download_and_store_beatmap(beatmap_id).await?);
-    BEATMAP_CACHE.insert(beatmap_id, Arc::clone(&beatmap));
-    return Ok(beatmap);
+    let beatmap = download_and_store_beatmap(beatmap_id).await?;
+    return Ok(insert_beatmap_into_cache(beatmap_id, beatmap));
   };
 
   decompress_and_parse_beatmap(beatmap_id, &beatmap)
@@ -242,9 +302,8 @@ pub(super) async fn fetch_and_store_beatmap(beatmap_id: u64) -> Result<Arc<Beatm
     return decompress_and_parse_beatmap(beatmap_id, &raw_beatmap_gzipped);
   }
 
-  let beatmap = Arc::new(download_and_store_beatmap(beatmap_id).await?);
-  BEATMAP_CACHE.insert(beatmap_id, Arc::clone(&beatmap));
-  Ok(beatmap)
+  let beatmap = download_and_store_beatmap(beatmap_id).await?;
+  Ok(insert_beatmap_into_cache(beatmap_id, beatmap))
 }
 
 fn compute_diff_attrs(

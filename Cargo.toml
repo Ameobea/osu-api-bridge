@@ -29,6 +29,7 @@ arc-swap = "1.7.1"
 fxhash = "0.2.1"
 pin-project = "1.1.5"
 dashmap = "6.1.0"
+moka = { version = "0.12.11", features = ["sync"] }
 
 [features]
 sql = ["sqlx"]

@@ -1,4 +1,4 @@
-use foundations::telemetry::metrics::{metrics, Counter, HistogramBuilder, TimeHistogram};
+use foundations::telemetry::metrics::{metrics, Counter, Gauge, HistogramBuilder, TimeHistogram};
 
 #[metrics]
 pub mod http_server {
@@ -34,4 +34,13 @@ pub mod http_server {
     buckets: &[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
   }]
   pub fn oauth_refresh_response_time_seconds() -> TimeHistogram;
+
+  /// Distribution of response times for downloading beatmaps.
+  #[ctor = HistogramBuilder {
+    buckets: &[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+  }]
+  pub fn beatmap_download_response_time_seconds() -> TimeHistogram;
+
+  /// Number of bytes currently cached in the beatmap cache.
+  pub fn beatmap_cache_bytes() -> Gauge;
 }
