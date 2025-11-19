@@ -91,7 +91,7 @@ async fn download_beatmap(beatmap_id: i32) -> Result<Vec<u8>, APIError> {
       let body = resp
         .text()
         .await
-        .unwrap_or_else(|_| "Failed to fetch body".to_string());
+        .unwrap_or_else(|_| "Failed to fetch body".to_owned());
       error!("Failed to fetch beatmap {beatmap_id} after {MAX_RETRIES} attempts: {status} {body}");
       return Err(APIError {
         status: StatusCode::NOT_FOUND,

@@ -32,6 +32,8 @@ port: 4510
 osu_client_id: 0
 # Osu! OAuth client secret
 osu_client_secret: ""
+# Salt used for analytics event verification.
+analytics_salt: "default-salt-change-me"
 sql:
   db_url: ""
 daily_challenge:

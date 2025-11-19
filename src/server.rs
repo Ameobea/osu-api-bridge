@@ -45,6 +45,7 @@ use crate::{
 
 #[cfg(feature = "sql")]
 mod admin;
+mod analytics;
 #[cfg(feature = "daily_challenge")]
 mod daily_challenge;
 #[cfg(feature = "simulate_play")]
@@ -612,6 +613,17 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
 
   let mut router = Router::new()
     .route("/", axum::routing::get(instrument_handler("index", index)))
+    .route(
+      "/a/v",
+      axum::routing::post(instrument_handler("submit_event", analytics::submit_event)),
+    )
+    .route(
+      "/a/z",
+      axum::routing::post(instrument_handler(
+        "submit_batch_events",
+        analytics::submit_batch_events,
+      )),
+    )
     .route(
       "/users/{user_id}/hiscores",
       axum::routing::get(instrument_handler("get_hiscores", get_hiscores)),

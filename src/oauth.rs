@@ -31,8 +31,8 @@ async fn fetch_access_token() -> Result<OAuthToken, APIError> {
   let form = [
     ("client_id", client_info.client_id.to_string()),
     ("client_secret", client_info.client_secret.to_string()),
-    ("grant_type", "client_credentials".to_string()),
-    ("scope", "public".to_string()),
+    ("grant_type", "client_credentials".to_owned()),
+    ("scope", "public".to_owned()),
   ];
   let res = REQWEST_CLIENT
     .post("https://osu.ppy.sh/oauth/token")

@@ -25,6 +25,8 @@ pub struct ServerSettings {
   pub osu_client_id: u32,
   /// Osu! OAuth client secret
   pub osu_client_secret: String,
+  /// Salt used for analytics event verification.
+  pub analytics_salt: String,
   #[cfg(feature = "sql")]
   pub sql: SqlSettings,
   #[cfg(feature = "daily_challenge")]

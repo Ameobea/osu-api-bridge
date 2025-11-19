@@ -43,4 +43,7 @@ pub mod http_server {
 
   /// Number of bytes currently cached in the beatmap cache.
   pub fn beatmap_cache_bytes() -> Gauge;
+
+  /// Number of analytics events.
+  pub fn analytics_events_total(category: String, subcategory: String) -> Counter;
 }
