@@ -465,8 +465,15 @@ pub async fn fetch_user_id(username: &str, mode: Ruleset) -> Result<u64, APIErro
   let res_text = make_osu_api_request(&proxy_url, endpoint_name, Method::GET).await?;
 
   let deserializer = &mut serde_json::Deserializer::from_str(&res_text);
-  match serde_path_to_error::deserialize::<_, User>(deserializer) {
-    Ok(user) => Ok(user.id),
+  match serde_path_to_error::deserialize::<_, FetchUserRes>(deserializer) {
+    Ok(FetchUserRes::User(user)) => Ok(user.id),
+    Ok(FetchUserRes::UserNotFound { .. }) => {
+      warn!("User not found: {username}; res: {res_text}");
+      Err(APIError {
+        status: StatusCode::NOT_FOUND,
+        message: "User not found".to_owned(),
+      })
+    },
     Err(err) => {
       error!("Failed to parse get user ID response; res: {res_text}; err: {err}");
       http_server::osu_api_requests_failed_total(endpoint_name, 200).inc();
