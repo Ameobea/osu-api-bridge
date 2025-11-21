@@ -45,6 +45,7 @@ use crate::{
 
 #[cfg(feature = "sql")]
 mod admin;
+mod analysis;
 mod analytics;
 #[cfg(feature = "daily_challenge")]
 mod daily_challenge;
@@ -611,6 +612,10 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
   #[cfg(feature = "sql")]
   crate::db::init_db_pool(&settings.sql.db_url).await?;
 
+  tokio::spawn(async {
+    let _ = analysis::update_analysis_data().await;
+  });
+
   let mut router = Router::new()
     .route("/", axum::routing::get(instrument_handler("index", index)))
     .route(
@@ -783,6 +788,40 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
         )),
       )
   }
+
+  router = router
+    .route(
+      "/analysis/dataset",
+      axum::routing::get(instrument_handler(
+        "get_analysis_dataset",
+        analysis::get_analysis_dataset,
+      )),
+    )
+    .route(
+      "/analysis/simulation-config",
+      axum::routing::get(instrument_handler(
+        "get_simulation_config",
+        analysis::get_simulation_config,
+      )),
+    )
+    .route(
+      "/analysis/refresh",
+      axum::routing::post(instrument_handler(
+        "refresh_analysis_data",
+        analysis::refresh_analysis_data,
+      )),
+    )
+    .route(
+      "/analysis/sanity/pp",
+      axum::routing::get(instrument_handler("get_sanity_pp", analysis::get_sanity_pp)),
+    )
+    .route(
+      "/analysis/sanity/decay",
+      axum::routing::get(instrument_handler(
+        "get_sanity_decay",
+        analysis::get_sanity_decay,
+      )),
+    );
 
   #[cfg(feature = "sql")]
   {

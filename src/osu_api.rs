@@ -277,12 +277,25 @@ pub struct User {
   pub username: String,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Ruleset {
   Osu,
   Taiko,
   Ctb,
   Mania,
+}
+
+impl Ruleset {
+  pub const ALL: [Ruleset; 4] = [Ruleset::Osu, Ruleset::Taiko, Ruleset::Ctb, Ruleset::Mania];
+
+  pub fn mode_value(self) -> i8 {
+    match self {
+      Ruleset::Osu => 0,
+      Ruleset::Taiko => 1,
+      Ruleset::Ctb => 2,
+      Ruleset::Mania => 3,
+    }
+  }
 }
 
 impl Display for Ruleset {

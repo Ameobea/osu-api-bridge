@@ -1,8 +1,8 @@
 code:
-  RUSTFLAGS="--cfg tokio_unstable --cfg foundations_unstable" code .
+  RUSTFLAGS="-C target-feature=+bmi1,+bmi2,+avx2 --cfg tokio_unstable --cfg foundations_unstable" code .
 
 generate-default-config:
-  RUSTFLAGS="--cfg tokio_unstable --cfg foundations_unstable" RUST_LOG=debug cargo run -- --generate default-config.yml
+  RUSTFLAGS="-C target-feature=+bmi1,+bmi2,+avx2 --cfg tokio_unstable --cfg foundations_unstable" RUST_LOG=debug cargo run -- --generate default-config.yml
 
 migrate:
   sqlx migrate run
@@ -11,10 +11,10 @@ docker-build:
   docker build --network host -t ameo/osu-api-bridge:latest .
 
 run:
-  RUSTFLAGS="--cfg tokio_unstable --cfg foundations_unstable" RUST_LOG=debug cargo run -- --config=config.yml
+  RUSTFLAGS="-C target-feature=+bmi1,+bmi2,+avx2 --cfg tokio_unstable --cfg foundations_unstable" RUST_LOG=debug cargo run -- --config=config.yml
 
 release:
-  RUSTFLAGS="--cfg tokio_unstable --cfg foundations_unstable" RUST_LOG=debug cargo run --release -- --config=config.yml
+  RUSTFLAGS="-C target-feature=+bmi1,+bmi2,+avx2 --cfg tokio_unstable --cfg foundations_unstable" RUST_LOG=debug cargo run --release -- --config=config.yml
 
 build-and-deploy:
   #!/bin/bash
