@@ -37,8 +37,8 @@ use crate::{
   metrics::http_server,
   oauth::set_client_info,
   osu_api::{
-    fetch_user_hiscores, BeatmapDifficulties, HiscoreV1, HiscoreV2, OsutrackDbBeatmap, Ruleset,
-    UserScoreOnBeatmap,
+    fetch_user_hiscores, BeatmapDifficulties, HiscoreV1, HiscoreV2, OsutrackDbBeatmap,
+    OsutrackUserStats, Ruleset, UserScoreOnBeatmap,
   },
   settings::ServerSettings,
 };
@@ -69,6 +69,25 @@ pub struct APIError {
 
 impl IntoResponse for APIError {
   fn into_response(self) -> Response { (self.status, self.message).into_response() }
+}
+
+#[derive(Deserialize)]
+struct GetUserStatsParams {
+  mode: Ruleset,
+}
+
+async fn get_user_stats(
+  Path(username): Path<String>,
+  Query(params): Query<GetUserStatsParams>,
+) -> Result<Json<OsutrackUserStats>, APIError> {
+  let Some(mode) = Ruleset::from_mode_value(params.mode.mode_value()) else {
+    return Err(APIError {
+      status: StatusCode::BAD_REQUEST,
+      message: format!("Invalid mode value: {}", params.mode.mode_value()),
+    });
+  };
+  let stats = crate::osu_api::fetch_osutrack_user_stats(&username, mode).await?;
+  Ok(Json(stats))
 }
 
 async fn get_hiscores(
@@ -628,6 +647,10 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
         "submit_batch_events",
         analytics::submit_batch_events,
       )),
+    )
+    .route(
+      "/users/{user_id}/stats",
+      axum::routing::get(instrument_handler("get_user_stats", get_user_stats)),
     )
     .route(
       "/users/{user_id}/hiscores",

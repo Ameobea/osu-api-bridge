@@ -288,13 +288,32 @@ pub enum Ruleset {
 impl Ruleset {
   pub const ALL: [Ruleset; 4] = [Ruleset::Osu, Ruleset::Taiko, Ruleset::Ctb, Ruleset::Mania];
 
-  pub fn mode_value(self) -> i8 {
+  pub fn mode_value(self) -> u8 {
     match self {
       Ruleset::Osu => 0,
       Ruleset::Taiko => 1,
       Ruleset::Ctb => 2,
       Ruleset::Mania => 3,
     }
+  }
+
+  pub fn from_mode_value(value: u8) -> Option<Ruleset> {
+    match value {
+      0 => Some(Ruleset::Osu),
+      1 => Some(Ruleset::Taiko),
+      2 => Some(Ruleset::Ctb),
+      3 => Some(Ruleset::Mania),
+      _ => None,
+    }
+  }
+}
+
+impl Serialize for Ruleset {
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: serde::Serializer,
+  {
+    serializer.serialize_u8(self.mode_value())
   }
 }
 
@@ -439,6 +458,164 @@ pub async fn fetch_user_hiscores(
       Err(APIError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         message: "Failed to parse user hiscores response".to_owned(),
+      })
+    },
+  }
+}
+
+#[derive(Deserialize)]
+struct OsutrackRawUserStats {
+  // pub id: String,
+  pub user: String,
+  pub count300: String,
+  pub count100: String,
+  pub count50: String,
+  pub playcount: String,
+  pub ranked_score: String,
+  pub total_score: String,
+  pub pp_rank: String,
+  pub level: String,
+  pub pp_raw: String,
+  pub accuracy: String,
+  pub count_rank_ss: String,
+  pub count_rank_s: String,
+  pub count_rank_a: String,
+  pub timestamp: String,
+  pub mode: String,
+  // pub exists: String,
+  pub username: String,
+}
+
+#[derive(Serialize)]
+pub struct OsutrackUserStats {
+  pub id: u64,
+  pub count300: u64,
+  pub count100: u64,
+  pub count50: u64,
+  pub playcount: u64,
+  pub ranked_score: u64,
+  pub total_score: u64,
+  pub pp_rank: u64,
+  pub level: f64,
+  pub pp_raw: f64,
+  pub accuracy: f64,
+  pub count_rank_ss: u64,
+  pub count_rank_s: u64,
+  pub count_rank_a: u64,
+  pub timestamp: chrono::NaiveDateTime,
+  pub mode: Ruleset,
+  pub username: String,
+}
+
+impl TryFrom<OsutrackRawUserStats> for OsutrackUserStats {
+  type Error = String;
+
+  fn try_from(value: OsutrackRawUserStats) -> Result<Self, Self::Error> {
+    fn parse_err(field: &str, value: &str) -> String {
+      format!("Failed to parse `{field}` on `OsutrackRawUserStats`; found: {value}")
+    }
+
+    Ok(OsutrackUserStats {
+      id: value
+        .user
+        .parse()
+        .map_err(|_| parse_err("user", &value.user))?,
+      count300: value
+        .count300
+        .parse()
+        .map_err(|_| parse_err("count300", &value.count300))?,
+      count100: value
+        .count100
+        .parse()
+        .map_err(|_| parse_err("count100", &value.count100))?,
+      count50: value
+        .count50
+        .parse()
+        .map_err(|_| parse_err("count50", &value.count50))?,
+      playcount: value
+        .playcount
+        .parse()
+        .map_err(|_| parse_err("playcount", &value.playcount))?,
+      ranked_score: value
+        .ranked_score
+        .parse()
+        .map_err(|_| parse_err("ranked_score", &value.ranked_score))?,
+      total_score: value
+        .total_score
+        .parse()
+        .map_err(|_| parse_err("total_score", &value.total_score))?,
+      pp_rank: value
+        .pp_rank
+        .parse()
+        .map_err(|_| parse_err("pp_rank", &value.pp_rank))?,
+      level: value
+        .level
+        .parse()
+        .map_err(|_| parse_err("level", &value.level))?,
+      pp_raw: value
+        .pp_raw
+        .parse()
+        .map_err(|_| parse_err("pp_raw", &value.pp_raw))?,
+      accuracy: value
+        .accuracy
+        .parse()
+        .map_err(|_| parse_err("accuracy", &value.accuracy))?,
+      count_rank_ss: value
+        .count_rank_ss
+        .parse()
+        .map_err(|_| parse_err("count_rank_ss", &value.count_rank_ss))?,
+      count_rank_s: value
+        .count_rank_s
+        .parse()
+        .map_err(|_| parse_err("count_rank_s", &value.count_rank_s))?,
+      count_rank_a: value
+        .count_rank_a
+        .parse()
+        .map_err(|_| parse_err("count_rank_a", &value.count_rank_a))?,
+      timestamp: chrono::NaiveDateTime::parse_from_str(&value.timestamp, "%Y-%m-%d %H:%M:%S")
+        .map_err(|_| parse_err("timestamp", &value.timestamp))?,
+      mode: match value.mode.as_str() {
+        "0" => Ruleset::Osu,
+        "1" => Ruleset::Taiko,
+        "2" => Ruleset::Ctb,
+        "3" => Ruleset::Mania,
+        _ => {
+          return Err(format!("Unknown mode: {}", value.mode));
+        },
+      },
+      username: value.username,
+    })
+  }
+}
+
+// Re-using old endpoint from osu!track
+// https://ameobea.me/osutrack/api/get_user.php?user=ameo&mode=0
+pub async fn fetch_osutrack_user_stats(
+  username: &str,
+  mode: Ruleset,
+) -> Result<OsutrackUserStats, APIError> {
+  let endpoint_name = "fetch_osutrack_user_stats";
+  let proxy_url = format!(
+    "https://ameobea.me/osutrack/api/get_user.php?user={username}&mode={}",
+    mode.mode_value()
+  );
+  let res_text = make_osu_api_request(&proxy_url, endpoint_name, Method::GET).await?;
+
+  let deserializer = &mut serde_json::Deserializer::from_str(&res_text);
+  match serde_path_to_error::deserialize::<_, OsutrackRawUserStats>(deserializer) {
+    Ok(raw_stats) => Ok(raw_stats.try_into().map_err(|err| {
+      error!("Failed to convert osutrack user stats: {err}");
+      APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: "Failed to parse osutrack user stats".to_owned(),
+      }
+    })?),
+    Err(err) => {
+      error!("Failed to parse osutrack user stats response; res: {res_text}; err: {err}");
+      http_server::osu_api_requests_failed_total(endpoint_name, 200).inc();
+      Err(APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: "Failed to parse osutrack user stats response".to_owned(),
       })
     },
   }

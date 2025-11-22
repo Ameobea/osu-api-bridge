@@ -30,7 +30,6 @@ use tracing::{error, info};
 #[derive(Clone, Serialize)]
 pub struct SimulationProfile {
   pub rank_to_decay: Vec<(u32, f32)>,
-  pub rank_to_pp: Vec<(u32, f32)>,
   pub rank_to_density: Vec<(u32, f32)>,
 }
 
@@ -877,22 +876,10 @@ fn generate_simulation_profile(
   for bucket_idx in 0..num_buckets {
     let rank = buckets[bucket_idx];
 
-    // Average PP over the lookback window.
-    let mut sum_pp = 0.;
-    let mut count_pp = 0;
-    for day in start_day..num_days {
-      let pp = pp_matrix[day * num_buckets + bucket_idx];
-      if pp > 0. {
-        sum_pp += pp;
-        count_pp += 1;
-      }
-    }
-    let avg_pp = if count_pp > 0 {
-      sum_pp / count_pp as f32
-    } else {
-      0.
-    };
-    rank_to_pp.push((rank, avg_pp));
+    // Decay is a noisy value so we want to average that, but we want to use the rank to pp profile
+    // from the most recent day since that's much more stable.
+    let latest_pp = pp_matrix[(num_days - 1) * num_buckets + bucket_idx];
+    rank_to_pp.push((rank, latest_pp));
 
     // Calculate decay by finding the slope of the rank trajectory for a fixed PP value.
     let start_pp = pp_matrix[start_day * num_buckets + bucket_idx];
@@ -950,7 +937,6 @@ fn generate_simulation_profile(
 
   SimulationProfile {
     rank_to_decay,
-    rank_to_pp,
     rank_to_density,
   }
 }
@@ -985,7 +971,6 @@ pub struct SanityCheckQuery {
 }
 
 pub async fn refresh_analysis_data(
-  Query(_params): Query<AnalysisQuery>,
   admin_api_token: String,
 ) -> Result<Json<&'static str>, APIError> {
   validate_admin_api_token(&admin_api_token)?;
