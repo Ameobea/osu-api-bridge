@@ -1,5 +1,3 @@
-use std::sync::atomic::AtomicU64;
-
 use foundations::telemetry::metrics::{metrics, Counter, Gauge, HistogramBuilder, TimeHistogram};
 
 #[metrics]
@@ -46,8 +44,11 @@ pub mod http_server {
   /// Number of bytes currently cached in the beatmap cache.
   pub fn beatmap_cache_bytes() -> Gauge;
 
-  /// Beatmap cache hit rate as a percentage.
-  pub fn beatmap_cache_hit_rate() -> Gauge<f64, AtomicU64>;
+  /// Number of beatmap cache hits.
+  pub fn beatmap_cache_hits_total() -> Counter;
+
+  /// Number of beatmap cache misses.
+  pub fn beatmap_cache_misses_total() -> Counter;
 
   /// Number of analytics events.
   pub fn analytics_events_total(category: String, subcategory: String) -> Counter;

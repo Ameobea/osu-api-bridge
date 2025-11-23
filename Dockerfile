@@ -1,6 +1,6 @@
 FROM debian:12.12-slim AS builder
 
-RUN apt-get update && apt-get install -y curl build-essential pkg-config libssl-dev
+RUN apt-get update && apt-get install -y curl build-essential pkg-config libssl-dev fontconfig libfontconfig1-dev
 
 # Install rust
 RUN curl https://sh.rustup.rs/ -sSf | \
@@ -14,7 +14,7 @@ RUN RUSTFLAGS="--cfg tokio_unstable --cfg foundations_unstable" cargo build --re
 
 FROM debian:12.12-slim
 
-RUN apt-get update && apt-get install -y libssl-dev ca-certificates && update-ca-certificates
+RUN apt-get update && apt-get install -y libssl-dev ca-certificates fontconfig libfontconfig1-dev && update-ca-certificates
 
 COPY --from=builder \
   /target/release/osu-api-bridge \

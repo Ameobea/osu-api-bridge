@@ -2,7 +2,7 @@ use std::{
   io::{Read, Write},
   str::FromStr,
   sync::{
-    atomic::{AtomicI64, AtomicU64, Ordering},
+    atomic::{AtomicI64, Ordering},
     Arc,
   },
   time::Duration,
@@ -115,8 +115,6 @@ async fn download_and_store_beatmap(beatmap_id: u64) -> Result<Beatmap, APIError
 
 lazy_static::lazy_static! {
   static ref BEATMAP_CACHE_BYTES: AtomicI64 = AtomicI64::new(0);
-  static ref BEATMAP_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
-  static ref BEATMAP_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
   static ref BEATMAP_CACHE: Cache<u64, Arc<Beatmap>> = Cache::builder()
     .max_capacity(10_000)
     .eviction_listener(|_key: Arc<u64>, val: Arc<Beatmap>, _cause| {
@@ -126,26 +124,6 @@ lazy_static::lazy_static! {
     })
     .build();
   static ref DOWNLOAD_SEMAPHORE: Semaphore = Semaphore::new(1);
-}
-
-fn update_cache_hit_rate(hit: bool) {
-  let (hits, misses) = if hit {
-    (
-      BEATMAP_CACHE_HITS.fetch_add(1, Ordering::Relaxed) + 1,
-      BEATMAP_CACHE_MISSES.load(Ordering::Relaxed),
-    )
-  } else {
-    (
-      BEATMAP_CACHE_HITS.load(Ordering::Relaxed),
-      BEATMAP_CACHE_MISSES.fetch_add(1, Ordering::Relaxed) + 1,
-    )
-  };
-
-  let total = hits + misses;
-  if total > 0 {
-    let rate = (hits as f64 / total as f64) * 100.0;
-    crate::metrics::http_server::beatmap_cache_hit_rate().set(rate);
-  }
 }
 
 fn estimate_beatmap_size(beatmap: &Beatmap) -> i64 {
@@ -235,10 +213,10 @@ async fn fetch_beatmaps_from_db(beatmap_ids: &[u64]) -> Result<Vec<(i64, Vec<u8>
 
 async fn fetch_beatmap(beatmap_id: u64) -> Result<Arc<Beatmap>, APIError> {
   if let Some(beatmap) = BEATMAP_CACHE.get(&beatmap_id) {
-    update_cache_hit_rate(true);
+    crate::metrics::http_server::beatmap_cache_hits_total().inc();
     return Ok(Arc::clone(&beatmap));
   }
-  update_cache_hit_rate(false);
+  crate::metrics::http_server::beatmap_cache_misses_total().inc();
 
   let beatmap = sqlx::query_scalar!(
     "SELECT raw_beatmap_gzipped FROM fetched_beatmaps WHERE beatmap_id = ?",
@@ -265,10 +243,10 @@ pub(super) async fn fetch_beatmaps_cached_only(beatmap_ids: &[u64]) -> Vec<Optio
 
   for &beatmap_id in beatmap_ids {
     if let Some(beatmap) = BEATMAP_CACHE.get(&beatmap_id) {
-      update_cache_hit_rate(true);
+      crate::metrics::http_server::beatmap_cache_hits_total().inc();
       results.insert(beatmap_id, Some(Arc::clone(&beatmap)));
     } else {
-      update_cache_hit_rate(false);
+      crate::metrics::http_server::beatmap_cache_misses_total().inc();
       missing_ids.push(beatmap_id);
     }
   }
@@ -310,10 +288,10 @@ pub(super) async fn fetch_beatmaps_cached_only(beatmap_ids: &[u64]) -> Vec<Optio
 
 pub(super) async fn fetch_and_store_beatmap(beatmap_id: u64) -> Result<Arc<Beatmap>, APIError> {
   if let Some(beatmap) = BEATMAP_CACHE.get(&beatmap_id) {
-    update_cache_hit_rate(true);
+    crate::metrics::http_server::beatmap_cache_hits_total().inc();
     return Ok(Arc::clone(&beatmap));
   }
-  update_cache_hit_rate(false);
+  crate::metrics::http_server::beatmap_cache_misses_total().inc();
 
   let db_result = sqlx::query_scalar!(
     "SELECT raw_beatmap_gzipped FROM fetched_beatmaps WHERE beatmap_id = ?",
