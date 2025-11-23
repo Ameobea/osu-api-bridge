@@ -852,6 +852,13 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
         "get_sanity_decay",
         analysis::get_sanity_decay,
       )),
+    )
+    .route(
+      "/analysis/debug/plot",
+      axum::routing::get(instrument_handler(
+        "get_analysis_plot",
+        analysis::get_analysis_plot,
+      )),
     );
 
   #[cfg(feature = "sql")]

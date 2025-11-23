@@ -794,11 +794,11 @@ pub mod daily_challenge {
     pub beatmap: Beatmap,
   }
 
-  #[derive(Deserialize)]
-  struct DifficultyRange {
-    // min: f32,
-    // max: f32,
-  }
+  // #[derive(Deserialize)]
+  // struct DifficultyRange {
+  //   // min: f32,
+  //   // max: f32,
+  // }
 
   #[derive(Deserialize)]
   struct Room {

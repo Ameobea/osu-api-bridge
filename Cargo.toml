@@ -33,6 +33,8 @@ moka = { version = "0.12.11", features = ["sync"] }
 sha2 = "0.10.9"
 nalgebra = "0.34.1"
 pco = "0.4.7"
+plotters = "0.3.7"
+image = { version = "0.25.9", default-features = false, features = ["png", "rayon"] }
 
 [features]
 sql = ["sqlx"]

@@ -1,4 +1,5 @@
 use std::{
+  io::Cursor,
   sync::{atomic::AtomicBool, Arc},
   time::Duration,
 };
@@ -17,8 +18,10 @@ use axum::{
 use chrono::NaiveDate;
 use dashmap::DashMap;
 use fxhash::{FxHashMap, FxHashSet};
+use image::{codecs::png::PngEncoder, ExtendedColorType, ImageEncoder, RgbImage};
 use lazy_static::lazy_static;
 use pco::{standalone::simple_compress, ChunkConfig, DeltaSpec, ModeSpec};
+use plotters::prelude::*;
 use serde::{Deserialize, Serialize};
 use sqlx::prelude::FromRow;
 use tokio::sync::{watch, RwLock};
@@ -31,6 +34,7 @@ use tracing::{error, info};
 pub struct SimulationProfile {
   pub rank_to_decay: Vec<(u32, f32)>,
   pub rank_to_density: Vec<(u32, f32)>,
+  pub rank_to_pp: Vec<(u32, f32)>,
 }
 
 #[derive(Clone, Serialize)]
@@ -549,10 +553,10 @@ fn detect_shocks(
     let n = pct_changes.len() as f32;
     let mean: f32 = pct_changes.iter().sum::<f32>() / n;
     // Use sample standard deviation (N-1) to match Pandas default
-    let std_dev: f32 = if n > 1.0 {
-      (pct_changes.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / (n - 1.0)).sqrt()
+    let std_dev: f32 = if n > 1. {
+      (pct_changes.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / (n - 1.)).sqrt()
     } else {
-      0.0
+      0.
     };
 
     for (idx, &pct_change) in pct_changes.iter().enumerate() {
@@ -834,7 +838,7 @@ fn get_rank_for_pp(pp_row: &[f32], buckets: &[u32], target_pp: f32) -> f32 {
   let idx = pp_row.partition_point(|&pp| pp > target_pp);
 
   if idx == 0 {
-    1.0
+    1.
   } else if idx >= num_buckets {
     buckets[num_buckets - 1] as f32
   } else {
@@ -857,6 +861,110 @@ fn get_rank_for_pp(pp_row: &[f32], buckets: &[u32], target_pp: f32) -> f32 {
       log_result.exp()
     }
   }
+}
+
+fn smooth_simulation_curve(
+  data: &[(u32, f32)],
+  min_bandwidth: f32,
+  max_bandwidth: f32,
+  bandwidth_scale: f32,
+) -> Vec<(u32, f32)> {
+  // filtering is handled in log/log space
+  let valid_points: Vec<(usize, f32, f32)> = data
+    .iter()
+    .enumerate()
+    .filter(|(_, (_, val))| *val > 1e-9)
+    .map(|(i, (rank, val))| (i, (*rank as f32).ln(), val.ln()))
+    .collect();
+
+  if valid_points.len() < 2 {
+    return data.to_vec();
+  }
+
+  let points_log: Vec<(f32, f32)> = valid_points.iter().map(|&(_, x, y)| (x, y)).collect();
+  let mut smoothed_values = Vec::with_capacity(data.len());
+
+  let kernel = |dist: f32, h: f32| (-0.5 * (dist / h).powi(2)).exp();
+
+  let mut initial_smooth = Vec::with_capacity(valid_points.len());
+  for &(x, _) in &points_log {
+    // adaptive bandwidth, applying stronger smoothing further down on the leaderboard
+    let h = min_bandwidth + (max_bandwidth - min_bandwidth) * (x / bandwidth_scale).min(1.);
+
+    let mut sum_wy = 0.;
+    let mut sum_w = 0.;
+
+    for &(px, py) in &points_log {
+      let dist = (x - px).abs();
+      if dist > h * 4. {
+        continue;
+      }
+      let w = kernel(dist, h);
+      sum_wy += w * py;
+      sum_w += w;
+    }
+
+    if sum_w > 1e-9 {
+      initial_smooth.push(sum_wy / sum_w);
+    } else {
+      initial_smooth.push(0.);
+    }
+  }
+
+  let mut residuals: Vec<f32> = valid_points
+    .iter()
+    .zip(initial_smooth.iter())
+    .map(|((_, _, y), smooth_y)| (y - smooth_y).abs())
+    .collect();
+
+  residuals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+  let median_res = residuals[residuals.len() / 2];
+
+  let robust_weights: Vec<f32> = valid_points
+    .iter()
+    .zip(initial_smooth.iter())
+    .map(|((_, _, y), smooth_y)| {
+      let r = (y - smooth_y).abs();
+      let s = 6. * median_res;
+      if s < 1e-9 {
+        1.
+      } else {
+        let u = (r / s).min(1.);
+        (1. - u * u).powi(2)
+      }
+    })
+    .collect();
+
+  for (rank, _) in data {
+    let x = (*rank as f32).ln();
+    let h = min_bandwidth + (max_bandwidth - min_bandwidth) * (x / bandwidth_scale).min(1.);
+
+    let mut sum_wy = 0.;
+    let mut sum_w = 0.;
+
+    for (i, &(px, py)) in points_log.iter().enumerate() {
+      let dist = (x - px).abs();
+      if dist > h * 4. {
+        continue;
+      }
+      let w = kernel(dist, h) * robust_weights[i];
+      sum_wy += w * py;
+      sum_w += w;
+    }
+
+    if sum_w > 1e-9 {
+      smoothed_values.push((*rank, (sum_wy / sum_w).exp()));
+    } else {
+      let nearest = points_log
+        .iter()
+        .min_by(|a, b| (a.0 - x).abs().partial_cmp(&(b.0 - x).abs()).unwrap())
+        .map(|&(_, y)| y.exp())
+        .unwrap_or(0.);
+      smoothed_values.push((*rank, nearest));
+    }
+  }
+
+  smoothed_values
 }
 
 fn generate_simulation_profile(
@@ -935,9 +1043,28 @@ fn generate_simulation_profile(
     rank_to_density.push((rank, ranks_per_pp));
   }
 
+  let min_bandwidth = 0.125;
+  let max_bandwidth = 0.35;
+  // Determines the log-rank value at which the bandwidth transitions from minimum to maximum
+  let bandwidth_scale = 10.;
+
+  let rank_to_decay = smooth_simulation_curve(
+    &rank_to_decay,
+    min_bandwidth,
+    max_bandwidth,
+    bandwidth_scale,
+  );
+  let rank_to_density = smooth_simulation_curve(
+    &rank_to_density,
+    min_bandwidth,
+    max_bandwidth,
+    bandwidth_scale,
+  );
+  let rank_to_pp = smooth_simulation_curve(&rank_to_pp, 0.001, 0.05, 10.);
   SimulationProfile {
     rank_to_decay,
     rank_to_density,
+    rank_to_pp,
   }
 }
 
@@ -1150,4 +1277,168 @@ pub async fn get_sanity_decay(
   let result = data.get_decay_history_for_rank(params.rank);
 
   Ok(Json(result))
+}
+
+pub async fn get_analysis_plot(Query(params): Query<AnalysisQuery>) -> Result<Response, APIError> {
+  let data = get_analysis_cache(params.mode).await?;
+  let profile = &data.simulation_profile;
+
+  let width: u32 = 1024;
+  let height: u32 = 1200;
+
+  let mut buffer = vec![0u8; (width as usize) * (height as usize) * 3];
+
+  {
+    let root = BitMapBackend::with_buffer(&mut buffer, (width, height)).into_drawing_area();
+    root.fill(&WHITE).map_err(|err| APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: format!("Failed to fill background: {err}"),
+    })?;
+
+    let areas = root.split_evenly((3, 1));
+
+    let num_days = data.dates.len();
+    let num_buckets = data.buckets.len();
+    let mut rank_to_pp = Vec::with_capacity(num_buckets);
+    for bucket_idx in 0..num_buckets {
+      let rank = data.buckets[bucket_idx];
+      let latest_pp = data.pp_matrix[(num_days - 1) * num_buckets + bucket_idx];
+      rank_to_pp.push((rank, latest_pp));
+    }
+
+    let mut chart_pp = ChartBuilder::on(&areas[0])
+      .caption("Rank vs PP", ("sans-serif", 30))
+      .margin(10)
+      .x_label_area_size(40)
+      .y_label_area_size(60)
+      .build_cartesian_2d(
+        (1f32..3_000_000f32).log_scale(),
+        (1f32..50_000f32).log_scale(),
+      )
+      .map_err(|e| APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("Failed to build chart: {}", e),
+      })?;
+
+    chart_pp
+      .configure_mesh()
+      .x_desc("Rank")
+      .y_desc("PP")
+      .draw()
+      .map_err(|e| APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("Failed to draw mesh: {}", e),
+      })?;
+
+    chart_pp
+      .draw_series(LineSeries::new(
+        rank_to_pp.iter().map(|(r, v)| (*r as f32, *v)),
+        &RED,
+      ))
+      .map_err(|e| APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("Failed to draw series: {}", e),
+      })?;
+
+    let mut chart_decay = ChartBuilder::on(&areas[1])
+      .caption("Rank vs Decay", ("sans-serif", 30))
+      .margin(10)
+      .x_label_area_size(40)
+      .y_label_area_size(60)
+      .build_cartesian_2d(
+        (1f32..3_000_000f32).log_scale(),
+        (1e-5f32..1000.0f32).log_scale(),
+      )
+      .map_err(|e| APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("Failed to build chart: {}", e),
+      })?;
+
+    chart_decay
+      .configure_mesh()
+      .x_desc("Rank")
+      .y_desc("Decay")
+      .draw()
+      .map_err(|e| APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("Failed to draw mesh: {}", e),
+      })?;
+
+    chart_decay
+      .draw_series(LineSeries::new(
+        profile
+          .rank_to_decay
+          .iter()
+          .map(|(r, v)| (*r as f32, *v))
+          .filter(|(_, v)| *v > 0.),
+        &BLUE,
+      ))
+      .map_err(|e| APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("Failed to draw series: {}", e),
+      })?;
+
+    let mut chart_density = ChartBuilder::on(&areas[2])
+      .caption("Rank vs Density", ("sans-serif", 30))
+      .margin(10)
+      .x_label_area_size(40)
+      .y_label_area_size(60)
+      .build_cartesian_2d(
+        (1f32..3_000_000f32).log_scale(),
+        (0.0001f32..1_000_000f32).log_scale(),
+      )
+      .map_err(|e| APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("Failed to build chart: {}", e),
+      })?;
+
+    chart_density
+      .configure_mesh()
+      .x_desc("Rank")
+      .y_desc("Density (Ranks per PP)")
+      .draw()
+      .map_err(|e| APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("Failed to draw mesh: {}", e),
+      })?;
+
+    chart_density
+      .draw_series(LineSeries::new(
+        profile
+          .rank_to_density
+          .iter()
+          .map(|(r, v)| (*r as f32, *v))
+          .filter(|(_, v)| *v > 0.),
+        &GREEN,
+      ))
+      .map_err(|e| APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("Failed to draw series: {}", e),
+      })?;
+
+    root.present().map_err(|err| APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: format!("Failed to present bitmap: {err}"),
+    })?;
+  }
+
+  let rgb_image = RgbImage::from_raw(width, height, buffer).ok_or_else(|| APIError {
+    status: StatusCode::INTERNAL_SERVER_ERROR,
+    message: "Failed to create image from raw buffer".into(),
+  })?;
+
+  let mut png_bytes = Vec::new();
+  {
+    let mut cursor = Cursor::new(&mut png_bytes);
+    let encoder = PngEncoder::new(&mut cursor);
+
+    encoder
+      .write_image(&rgb_image, width, height, ExtendedColorType::Rgb8)
+      .map_err(|err| APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("Failed to encode PNG: {err}"),
+      })?;
+  }
+
+  Ok(([(header::CONTENT_TYPE, "image/png")], png_bytes).into_response())
 }
