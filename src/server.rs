@@ -4,6 +4,7 @@ use std::{
   pin::Pin,
   sync::Arc,
   task::{Context, Poll},
+  time::Duration,
 };
 
 use arc_swap::ArcSwap;
@@ -635,6 +636,13 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
     let _ = analysis::update_analysis_data().await;
   });
 
+  tokio::spawn(async {
+    loop {
+      let _ = admin::update_oldest_user_inner().await;
+      tokio::time::sleep(Duration::from_secs(20)).await;
+    }
+  });
+
   let mut router = Router::new()
     .route("/", axum::routing::get(instrument_handler("index", index)))
     .route(
@@ -861,6 +869,13 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
         axum::routing::post(instrument_handler(
           "maybe_undelete_user",
           admin::maybe_undelete_user,
+        )),
+      )
+      .route(
+        "/update-oldest-user",
+        axum::routing::post(instrument_handler(
+          "update_oldest_user",
+          admin::update_oldest_user,
         )),
       );
   }
