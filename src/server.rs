@@ -639,7 +639,15 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
   tokio::spawn(async {
     loop {
       let _ = admin::update_oldest_user_inner().await;
-      tokio::time::sleep(Duration::from_secs(20)).await;
+      tokio::time::sleep(Duration::from_secs(17)).await;
+    }
+  });
+
+  tokio::spawn(async {
+    loop {
+      let user_id: u64 = rand::Rng::random_range(&mut rand::rng(), 3..40_000_000);
+      let _ = admin::update_all_modes_for_user(user_id).await;
+      tokio::time::sleep(Duration::from_secs(58)).await;
     }
   });
 

@@ -35,6 +35,7 @@ nalgebra = "0.34.1"
 pco = "0.4.7"
 plotters = "0.3.7"
 image = { version = "0.25.9", default-features = false, features = ["png", "rayon"] }
+rand = "0.9"
 
 [features]
 sql = ["sqlx"]

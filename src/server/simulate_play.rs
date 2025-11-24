@@ -116,7 +116,7 @@ async fn download_and_store_beatmap(beatmap_id: u64) -> Result<Beatmap, APIError
 lazy_static::lazy_static! {
   static ref BEATMAP_CACHE_BYTES: AtomicI64 = AtomicI64::new(0);
   static ref BEATMAP_CACHE: Cache<u64, Arc<Beatmap>> = Cache::builder()
-    .max_capacity(10_000)
+    .max_capacity(20_000)
     .eviction_listener(|_key: Arc<u64>, val: Arc<Beatmap>, _cause| {
       let bytes = estimate_beatmap_size(&val);
       let new_total = BEATMAP_CACHE_BYTES.fetch_sub(bytes, Ordering::Relaxed) - bytes;

@@ -732,6 +732,14 @@ fn smooth_matrix(
       weight_sum += weight;
     }
 
+    // apply lighter smoothing towards the most recent day to make the data more responsive
+    let days_from_end = num_days - 1 - i;
+    let recent_factor = if days_from_end < 5 {
+      (1. - (days_from_end as f32 / 5.)) * 0.85
+    } else {
+      0.
+    };
+
     for bucket in 0..num_buckets {
       let mut weighted_sum = 0.;
       for (j, &weight) in weights.iter().enumerate() {
@@ -739,7 +747,9 @@ fn smooth_matrix(
         let val = pp_matrix[day * num_buckets + bucket];
         weighted_sum += val * weight;
       }
-      smoothed[i * num_buckets + bucket] = weighted_sum / weight_sum;
+      let smoothed_val = weighted_sum / weight_sum;
+      smoothed[i * num_buckets + bucket] =
+        smoothed_val * (1. - recent_factor) + pp_matrix[i * num_buckets + bucket] * recent_factor;
     }
   }
 

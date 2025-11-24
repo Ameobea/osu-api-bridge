@@ -254,6 +254,32 @@ pub(super) struct UpdateOldestUserQueryParams {
   count: Option<usize>,
 }
 
+pub(crate) async fn update_all_modes_for_user(user_id: u64) -> Result<(), APIError> {
+  for mode in 0..=3 {
+    let url = format!("https://ameobea.me/osutrack/api/get_changes.php?mode={mode}&id={user_id}");
+    let res = match reqwest::get(&url).await {
+      Ok(res) => res,
+      Err(err) => {
+        error!("Error fetching osu! API data for user ID {user_id}, mode {mode}: {err}");
+        continue;
+      },
+    };
+    if res.status() != StatusCode::OK {
+      error!(
+        "Non-200 response fetching osu! API data for user ID {user_id}, mode {mode}: status={}",
+        res.status()
+      );
+      continue;
+    }
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+  }
+
+  info!("Updated oldest user id={user_id}");
+
+  Ok(())
+}
+
 pub(crate) async fn update_oldest_user_inner() -> Result<(), APIError> {
   let pool = db_pool();
   let oldest_user: Option<i64> = sqlx::query_scalar(
@@ -292,27 +318,7 @@ pub(crate) async fn update_oldest_user_inner() -> Result<(), APIError> {
       }
     })?;
 
-  for mode in 0..=3 {
-    let url = format!("https://ameobea.me/osutrack/api/get_changes.php?mode={mode}&id={user_id}");
-    let res = match reqwest::get(&url).await {
-      Ok(res) => res,
-      Err(err) => {
-        error!("Error fetching osu! API data for user ID {user_id}, mode {mode}: {err}");
-        continue;
-      },
-    };
-    if res.status() != StatusCode::OK {
-      error!(
-        "Non-200 response fetching osu! API data for user ID {user_id}, mode {mode}: status={}",
-        res.status()
-      );
-      continue;
-    }
-
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-  }
-
-  info!("Updated oldest user id={user_id}");
+  update_all_modes_for_user(user_id as u64).await?;
 
   Ok(())
 }
