@@ -116,7 +116,7 @@ async fn download_and_store_beatmap(beatmap_id: u64) -> Result<Beatmap, APIError
 lazy_static::lazy_static! {
   static ref BEATMAP_CACHE_BYTES: AtomicI64 = AtomicI64::new(0);
   static ref BEATMAP_CACHE: Cache<u64, Arc<Beatmap>> = Cache::builder()
-    .max_capacity(20_000)
+    .max_capacity(40_000)
     .eviction_listener(|_key: Arc<u64>, val: Arc<Beatmap>, _cause| {
       let bytes = estimate_beatmap_size(&val);
       let new_total = BEATMAP_CACHE_BYTES.fetch_sub(bytes, Ordering::Relaxed) - bytes;
@@ -169,6 +169,7 @@ fn decompress_and_parse_beatmap(
   beatmap_id: u64,
   raw_beatmap_gzipped: &[u8],
 ) -> Result<Arc<Beatmap>, APIError> {
+  let _timer = crate::metrics::http_server::beatmap_parse_time_seconds().start_timer();
   let mut decoder = flate2::read::GzDecoder::new(raw_beatmap_gzipped);
   let mut decompressed = Vec::new();
   decoder
@@ -187,14 +188,15 @@ fn decompress_and_parse_beatmap(
 }
 
 async fn fetch_beatmaps_from_db(beatmap_ids: &[u64]) -> Result<Vec<(i64, Vec<u8>)>, APIError> {
+  let _timer = crate::metrics::http_server::beatmap_batch_db_fetch_time_seconds().start_timer();
   let placeholders = beatmap_ids
     .iter()
     .map(|_| "?")
     .collect::<Vec<_>>()
     .join(",");
   let query_str = format!(
-    "SELECT beatmap_id, raw_beatmap_gzipped FROM fetched_beatmaps WHERE beatmap_id IN ({})",
-    placeholders
+    "SELECT beatmap_id, raw_beatmap_gzipped FROM fetched_beatmaps WHERE beatmap_id IN \
+     ({placeholders})",
   );
 
   let mut query = sqlx::query_as::<_, (i64, Vec<u8>)>(&query_str);
