@@ -193,6 +193,8 @@ async fn compute_beatmap_difficulties(
   ),
   APIError,
 > {
+  let _timer = http_server::compute_beatmap_difficulties_duration().start_timer();
+
   let beatmap_ids: Vec<u64> = hiscores
     .iter()
     .map(|hiscore| hiscore.beatmap_id as u64)
@@ -382,8 +384,7 @@ async fn get_hiscores_v2(
   let query = format!(
     "SELECT beatmapset_id,beatmap_id,approved,approved_date,last_update,total_length,hit_length,\
      version,artist,title,creator,bpm,source,difficultyrating,diff_size,diff_overall,\
-     diff_approach,diff_drain,mode FROM beatmaps WHERE beatmap_id IN ({})",
-    beatmap_ids_string
+     diff_approach,diff_drain,mode FROM beatmaps WHERE beatmap_id IN ({beatmap_ids_string})"
   );
   let query = sqlx::query_as::<_, OsutrackDbBeatmap>(&query);
   let beatmaps_meta = query
@@ -398,14 +399,17 @@ async fn get_hiscores_v2(
     .map(|bm| (bm.beatmap_id as u64, bm))
     .collect::<FxHashMap<u64, OsutrackDbBeatmap>>();
 
-  let (difficulties, attrs_with_mods, performance_attrs) =
-    compute_beatmap_difficulties(&hiscores_v2, &beatmaps_meta).await?;
+  let computed_diffs = if params.mode == Ruleset::Osu {
+    Some(compute_beatmap_difficulties(&hiscores_v2, &beatmaps_meta).await?)
+  } else {
+    None
+  };
 
   let mut difficulties_by_beatmap_id: FxHashMap<u64, BeatmapDifficulties> = FxHashMap::default();
   let mut performance_attrs_by_score_id: FxHashMap<i64, PerfAttrs> = FxHashMap::default();
 
   // TODO: would have to handle mode-specific difficulties later
-  if params.mode == Ruleset::Osu {
+  if let Some((difficulties, _attrs_with_mods, performance_attrs)) = computed_diffs.as_ref() {
     for (i, hiscore) in hiscores_v2.iter().enumerate() {
       if let Some(diff) = &difficulties[i] {
         difficulties_by_beatmap_id.insert(hiscore.beatmap_id as u64, diff.clone());
@@ -416,15 +420,20 @@ async fn get_hiscores_v2(
     }
   }
 
-  let attrs_with_mods: FxHashMap<u64, BeatmapAttrs> = hiscores_v2
-    .iter()
-    .enumerate()
-    .filter_map(|(i, hiscore)| {
-      attrs_with_mods[i]
-        .as_ref()
-        .map(|attrs| (hiscore.beatmap_id as u64, attrs.clone()))
-    })
-    .collect();
+  let attrs_with_mods: FxHashMap<u64, BeatmapAttrs> =
+    if let Some((_difficulties, attrs_with_mods, _performance_attrs)) = computed_diffs.as_ref() {
+      hiscores_v2
+        .iter()
+        .enumerate()
+        .filter_map(|(i, hiscore)| {
+          attrs_with_mods[i]
+            .as_ref()
+            .map(|attrs| (hiscore.beatmap_id as u64, attrs.clone()))
+        })
+        .collect()
+    } else {
+      Default::default()
+    };
 
   Ok(Json(GetHiscoresV2Response {
     hiscores: hiscores_v2,

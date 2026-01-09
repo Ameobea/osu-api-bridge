@@ -53,6 +53,12 @@ pub mod http_server {
   }]
   pub fn beatmap_batch_db_fetch_time_seconds() -> TimeHistogram;
 
+  /// Distribution of compute beatmap difficulties durations
+  #[ctor = HistogramBuilder {
+    buckets: &[0.00001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25],
+  }]
+  pub fn compute_beatmap_difficulties_duration() -> TimeHistogram;
+
   /// Number of bytes currently cached in the beatmap cache
   pub fn beatmap_cache_bytes() -> Gauge;
 

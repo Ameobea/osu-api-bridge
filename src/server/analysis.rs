@@ -984,7 +984,7 @@ fn generate_simulation_profile(
   shocks: &[usize],
 ) -> SimulationProfile {
   let num_buckets = buckets.len();
-  let lookback = 180.min(num_days);
+  let lookback = 30.min(num_days);
   let start_day = num_days.saturating_sub(lookback);
 
   let mut rank_to_decay = Vec::with_capacity(num_buckets);

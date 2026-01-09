@@ -3,7 +3,7 @@ use std::{
   str::FromStr,
   sync::{
     atomic::{AtomicI64, Ordering},
-    Arc,
+    Arc, Mutex as SyncMutex,
   },
   time::Duration,
 };
@@ -260,26 +260,54 @@ pub(super) async fn fetch_beatmaps_cached_only(beatmap_ids: &[u64]) -> Vec<Optio
       .collect();
   }
 
-  let db_results = fetch_beatmaps_from_db(&missing_ids)
-    .await
-    .unwrap_or_else(|_| Vec::new());
+  let Ok(db_results) = fetch_beatmaps_from_db(&missing_ids).await else {
+    return beatmap_ids
+      .iter()
+      .map(|id| results.get(id).unwrap_or(&None).clone())
+      .collect();
+  };
 
-  for &beatmap_id in &missing_ids {
-    if let Some((_, raw_beatmap_gzipped)) =
-      db_results.iter().find(|(id, _)| *id == beatmap_id as i64)
-    {
-      match decompress_and_parse_beatmap(beatmap_id, raw_beatmap_gzipped) {
-        Ok(beatmap) => {
-          results.insert(beatmap_id, Some(beatmap));
-        },
+  let worker_count = missing_ids.len().min(num_cpus::get());
+  let work = Arc::new(SyncMutex::new(missing_ids));
+  let db_results = Arc::new(db_results);
+  let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+
+  for _ in 0..worker_count {
+    let work = Arc::clone(&work);
+    let tx = tx.clone();
+    let db_results = Arc::clone(&db_results);
+
+    tokio::task::spawn_blocking(move || loop {
+      let res = { work.lock().map(|mut ids| ids.pop()) };
+      let Ok(Some(beatmap_id)) = res else {
+        return;
+      };
+
+      let Some((_, raw_beatmap_gzipped)) =
+        db_results.iter().find(|(id, _)| *id == beatmap_id as i64)
+      else {
+        let _ = tx.blocking_send((beatmap_id, None));
+        continue;
+      };
+
+      let beatmap_opt = match decompress_and_parse_beatmap(beatmap_id, raw_beatmap_gzipped) {
+        Ok(beatmap) => Some(beatmap),
         Err(err) => {
           error!("Error processing beatmap {beatmap_id}: {}", err.message);
-          results.insert(beatmap_id, None);
+          None
         },
-      }
-    } else {
-      results.insert(beatmap_id, None);
-    }
+      };
+
+      let Ok(()) = tx.blocking_send((beatmap_id, beatmap_opt)) else {
+        error!("rx went away for beatmap parsing worker");
+        return;
+      };
+    });
+  }
+
+  drop(tx);
+  while let Some((beatmap_id, beatmap_opt)) = rx.recv().await {
+    results.insert(beatmap_id, beatmap_opt);
   }
 
   beatmap_ids

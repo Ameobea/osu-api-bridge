@@ -7,7 +7,7 @@ edition = "2021"
 
 [dependencies]
 foundations = { version = "5.3", default-features = false, features = ["settings", "metrics", "telemetry-server", "testing", "jemalloc", "tokio-runtime-metrics", "memory-profiling", "cli"] }
-tokio = { version = "1.36", features = ["full"] }
+tokio = { version = "1.48", features = ["full"] }
 serde_default_utils = "0.3"
 axum = { version = "0.8", features = ["tower-log"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
@@ -36,6 +36,7 @@ pco = "0.4.7"
 plotters = "0.3.7"
 image = { version = "0.25.9", default-features = false, features = ["png", "rayon"] }
 rand = "0.9"
+num_cpus = "1.17.0"
 
 [features]
 sql = ["sqlx"]
