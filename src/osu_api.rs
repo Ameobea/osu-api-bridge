@@ -727,6 +727,149 @@ pub async fn fetch_username(user_id: u64) -> Result<Option<String>, APIError> {
   }
 }
 
+#[derive(Deserialize, Debug)]
+pub struct V2Level {
+  pub current: u32,
+  #[serde(default)]
+  pub progress: u32,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct V2GradeCounts {
+  #[serde(default)]
+  pub ss: i64,
+  #[serde(default)]
+  pub ssh: i64,
+  #[serde(default)]
+  pub s: i64,
+  #[serde(default)]
+  pub sh: i64,
+  #[serde(default)]
+  pub a: i64,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct V2UserStatistics {
+  #[serde(default)]
+  pub global_rank: Option<u64>,
+  #[serde(default)]
+  pub pp: f64,
+  #[serde(default)]
+  pub hit_accuracy: f64,
+  #[serde(default)]
+  pub play_count: u64,
+  #[serde(default)]
+  pub ranked_score: u64,
+  #[serde(default)]
+  pub total_score: u64,
+  #[serde(default)]
+  pub count_300: u64,
+  #[serde(default)]
+  pub count_100: u64,
+  #[serde(default)]
+  pub count_50: u64,
+  pub level: V2Level,
+  pub grade_counts: V2GradeCounts,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug)]
+pub struct MatchmakingPool {
+  pub id: i64,
+  pub name: String,
+  pub ruleset_id: i32,
+  pub variant_id: Option<i32>,
+  pub active: bool,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug)]
+pub struct MatchmakingStat {
+  pub pool_id: i64,
+  pub pool: MatchmakingPool,
+  pub rating: f32,
+  pub rank: i32,
+  pub plays: i32,
+  pub first_placements: i32,
+  pub total_points: i64,
+  pub is_rating_provisional: bool,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct V2UserForOsutrack {
+  pub id: u64,
+  pub username: String,
+  pub country_code: String,
+  pub statistics: V2UserStatistics,
+  #[serde(default)]
+  pub matchmaking_stats: Vec<MatchmakingStat>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FetchV2UserRes {
+  User(Box<V2UserForOsutrack>),
+  UserNotFound {
+    #[allow(dead_code)]
+    error: Option<serde_json::Value>,
+  },
+}
+
+/// Fetches a user from the v2 OAuth API using either a numeric user ID or a username. Returns
+/// `Ok(None)` when the user does not exist (banned / deleted / never existed).
+///
+/// Used by the osutrack update endpoint; the single response carries both the legacy stat fields
+/// and the newer `matchmaking_stats` array so the update path only needs one upstream call.
+pub async fn fetch_v2_user_for_osutrack(
+  user: &str,
+  mode: Ruleset,
+) -> Result<Option<V2UserForOsutrack>, APIError> {
+  let endpoint_name = "fetch_v2_user_for_osutrack";
+  let proxy_url = format!("https://osu.ppy.sh/api/v2/users/{user}/{mode}");
+  let res_text = make_osu_api_request(&proxy_url, endpoint_name, Method::GET).await?;
+
+  let deserializer = &mut serde_json::Deserializer::from_str(&res_text);
+  match serde_path_to_error::deserialize::<_, FetchV2UserRes>(deserializer) {
+    Ok(FetchV2UserRes::User(u)) => Ok(Some(*u)),
+    Ok(FetchV2UserRes::UserNotFound { .. }) => {
+      warn!("v2 user not found: {user} (mode={mode}); res: {res_text}");
+      Ok(None)
+    },
+    Err(err) => {
+      error!("Failed to parse v2 user response; res: {res_text}; err: {err}");
+      http_server::osu_api_requests_failed_total(endpoint_name, 200).inc();
+      Err(APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: "Failed to parse v2 user response".to_owned(),
+      })
+    },
+  }
+}
+
+#[derive(Debug)]
+pub struct UserInfo {
+  pub username: String,
+  pub statistics: Option<UserInfoStatistics>,
+}
+
+#[derive(Debug)]
+pub struct UserInfoStatistics {
+  pub pp: Option<f64>,
+}
+
+pub async fn fetch_user_info(
+  user_id: u64,
+  mode: Ruleset,
+) -> Result<Option<UserInfo>, APIError> {
+  match fetch_v2_user_for_osutrack(&user_id.to_string(), mode).await? {
+    Some(u) => Ok(Some(UserInfo {
+      username: u.username,
+      statistics: Some(UserInfoStatistics {
+        pp: Some(u.statistics.pp),
+      }),
+    })),
+    None => Ok(None),
+  }
+}
+
 #[cfg(feature = "daily_challenge")]
 pub mod daily_challenge {
   use chrono::DateTime;

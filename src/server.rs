@@ -50,6 +50,8 @@ mod analysis;
 mod analytics;
 #[cfg(feature = "daily_challenge")]
 mod daily_challenge;
+#[cfg(feature = "sql")]
+mod osutrack_update;
 #[cfg(feature = "simulate_play")]
 mod simulate_play;
 
@@ -900,6 +902,13 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
         axum::routing::post(instrument_handler(
           "update_oldest_user",
           admin::update_oldest_user,
+        )),
+      )
+      .route(
+        "/users/{user}/update",
+        axum::routing::post(instrument_handler(
+          "osutrack_update",
+          osutrack_update::osutrack_update,
         )),
       );
   }

@@ -115,8 +115,9 @@ async fn build_and_run_user_daily_challenge_score_query(
 
   qb.push(
     "ON DUPLICATE KEY UPDATE pp = VALUES(pp), rank = VALUES(rank), statistics = \
-     VALUES(statistics), total_score = VALUES(total_score), started_at = VALUES(started_at), mods \
-     = VALUES(mods), max_combo = VALUES(max_combo), accuracy = VALUES(accuracy)",
+     VALUES(statistics), total_score = VALUES(total_score), started_at = VALUES(started_at), \
+     ended_at = VALUES(ended_at), mods = VALUES(mods), max_combo = VALUES(max_combo), accuracy = \
+     VALUES(accuracy), score_id = VALUES(score_id), user_rank = VALUES(user_rank)",
   );
   let query = qb.build();
   txn.execute(query).await?;
@@ -165,84 +166,134 @@ async fn store_daily_challenge_scores(
 pub(super) async fn backfill_daily_challenges(
   Query(LoadUserTotalScoreRankingsQueryParams {
     fetch_missing_usernames,
+    full_history,
+    day_id: single_day_id,
     ..
   }): Query<LoadUserTotalScoreRankingsQueryParams>,
   admin_api_token: String,
 ) -> Result<(), APIError> {
   validate_admin_api_token(&admin_api_token)?;
 
+  let full_history = full_history.unwrap_or(false);
+
   let mut all_daily_challenge_ids =
     osu_api::daily_challenge::get_daily_challenge_descriptors(false).await?;
 
-  let mut txn = db_pool().begin().await.map_err(|err| {
-    error!("Failed to start transaction for daily challenge backfill: {err}");
-    APIError {
-      status: StatusCode::INTERNAL_SERVER_ERROR,
-      message: "Failed to start transaction for daily challenge backfill".to_owned(),
+  if let Some(target_day_id) = single_day_id {
+    info!("Single day backfill mode: filtering to day_id={target_day_id}");
+    all_daily_challenge_ids.retain(|ids| ids.day_id == target_day_id);
+    if all_daily_challenge_ids.is_empty() {
+      return Err(APIError {
+        status: StatusCode::NOT_FOUND,
+        message: format!("day_id {target_day_id} not found in API response"),
+      });
     }
-  })?;
+  }
 
-  let already_collected_day_ids: FxHashSet<usize> =
-    sqlx::query_scalar!("SELECT day_id FROM daily_challenge_metadata;")
-      .fetch_all(&mut *txn)
-      .await
-      .map_err(|err| {
-        error!("Failed to fetch already collected daily challenge IDs from DB: {err}");
-        APIError {
-          status: StatusCode::INTERNAL_SERVER_ERROR,
-          message: "Failed to fetch already collected daily challenge IDs from DB".to_owned(),
-        }
-      })?
-      .into_iter()
-      .map(|id| id as usize)
-      .collect();
+  if full_history {
+    info!(
+      "Full history backfill mode: upserting scores for all {} daily challenges, skipping metadata",
+      all_daily_challenge_ids.len(),
+    );
+  } else {
+    let already_collected_day_ids: FxHashSet<usize> =
+      sqlx::query_scalar!("SELECT day_id FROM daily_challenge_metadata;")
+        .fetch_all(db_pool())
+        .await
+        .map_err(|err| {
+          error!("Failed to fetch already collected daily challenge IDs from DB: {err}");
+          APIError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "Failed to fetch already collected daily challenge IDs from DB".to_owned(),
+          }
+        })?
+        .into_iter()
+        .map(|id| id as usize)
+        .collect();
 
-  all_daily_challenge_ids.retain(|ids| !already_collected_day_ids.contains(&ids.day_id));
-  store_daily_challenge_metadata(&mut txn, &all_daily_challenge_ids)
-    .await
-    .map_err(|err| {
-      error!("Failed to store daily challenge metadata in DB: {err}");
-      APIError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: "Failed to store daily challenge metadata in DB".to_owned(),
-      }
-    })?;
+    all_daily_challenge_ids.retain(|ids| !already_collected_day_ids.contains(&ids.day_id));
 
-  if !all_daily_challenge_ids.is_empty() {
     info!(
       "Found {} uncollected daily challenges to backfill",
       all_daily_challenge_ids.len(),
     );
+  }
 
-    for ids in all_daily_challenge_ids {
-      info!("Fetching daily challenge scores for {}...", ids.day_id);
-      let scores = osu_api::daily_challenge::fetch_daily_challenge_scores(&ids).await?;
-      info!(
-        "Fetched {} scores for daily challenge {}.  Storing...",
-        scores.len(),
-        ids.day_id
-      );
+  let mut succeeded = 0usize;
+  let mut failed = 0usize;
+  let total = all_daily_challenge_ids.len();
 
-      match store_daily_challenge_scores(ids.day_id, scores, &mut txn).await {
-        Ok(_) => info!(
-          "Successfully stored daily challenge scores for {}",
+  for ids in all_daily_challenge_ids {
+    info!("Fetching daily challenge scores for {}...", ids.day_id);
+    let scores = match osu_api::daily_challenge::fetch_daily_challenge_scores(&ids).await {
+      Ok(scores) => scores,
+      Err(err) => {
+        error!(
+          "Failed to fetch scores for daily challenge {}: {err:?}",
           ids.day_id
-        ),
-        Err(err) => error!(
+        );
+        failed += 1;
+        continue;
+      },
+    };
+    info!(
+      "Fetched {} scores for daily challenge {}.  Storing...",
+      scores.len(),
+      ids.day_id
+    );
+
+    let mut txn = db_pool().begin().await.map_err(|err| {
+      error!("Failed to start transaction for daily challenge backfill: {err}");
+      APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: "Failed to start transaction for daily challenge backfill".to_owned(),
+      }
+    })?;
+
+    if !full_history {
+      store_daily_challenge_metadata(&mut txn, std::slice::from_ref(&ids))
+        .await
+        .map_err(|err| {
+          error!(
+            "Failed to store daily challenge metadata for {}: {err}",
+            ids.day_id
+          );
+          APIError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "Failed to store daily challenge metadata in DB".to_owned(),
+          }
+        })?;
+    }
+
+    match store_daily_challenge_scores(ids.day_id, scores, &mut txn).await {
+      Ok(_) => {
+        txn.commit().await.map_err(|err| {
+          error!(
+            "Failed to commit transaction for daily challenge {}: {err}",
+            ids.day_id
+          );
+          APIError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "Failed to commit transaction for daily challenge backfill".to_owned(),
+          }
+        })?;
+        succeeded += 1;
+        info!(
+          "Successfully stored daily challenge scores for {} ({succeeded}/{total})",
+          ids.day_id
+        );
+      },
+      Err(err) => {
+        error!(
           "Failed to store daily challenge scores for {}: {err}",
           ids.day_id
-        ),
-      }
+        );
+        failed += 1;
+      },
     }
   }
 
-  txn.commit().await.map_err(|err| {
-    error!("Failed to commit transaction for daily challenge backfill: {err}");
-    APIError {
-      status: StatusCode::INTERNAL_SERVER_ERROR,
-      message: "Failed to commit transaction for daily challenge backfill".to_owned(),
-    }
-  })?;
+  info!("Backfill complete: {succeeded} succeeded, {failed} failed out of {total} total");
 
   tokio::spawn(async move {
     info!("Refreshing daily challenge stats cache...");
@@ -1108,7 +1159,8 @@ async fn populate_missing_usernames(
 
   let client = reqwest::Client::new();
   for id in missing_user_ids {
-    let url = format!("https://osutrack-api.ameo.dev/update?user={id}&mode=0");
+    // let url = format!("https://osutrack-api.ameo.dev/update?user={id}&mode=0");
+    let url = format!("https://ameobea.me/osutrack/api/get_changes.php?mode=0&id=${id}");
     let req = client.post(&url).send().await;
     match req {
       Ok(res) =>
@@ -1180,6 +1232,8 @@ async fn build_rankings(
 pub(crate) struct LoadUserTotalScoreRankingsQueryParams {
   fetch_missing_usernames: Option<bool>,
   page: Option<usize>,
+  full_history: Option<bool>,
+  day_id: Option<usize>,
 }
 
 async fn load_user_total_score_rankings(
@@ -2180,10 +2234,9 @@ pub(crate) async fn get_daily_challenge_stats_for_day(
 
 pub(crate) async fn get_daily_challenge_rankings_for_day(
   Path(day_id): Path<usize>,
-  Query(LoadUserTotalScoreRankingsQueryParams {
-    page,
-    fetch_missing_usernames: _,
-  }): Query<LoadUserTotalScoreRankingsQueryParams>,
+  Query(LoadUserTotalScoreRankingsQueryParams { page, .. }): Query<
+    LoadUserTotalScoreRankingsQueryParams,
+  >,
 ) -> Result<Json<Vec<DailyChallengeTotalScoreRankingEntry>>, APIError> {
   let page_size = 50;
   let start = (page.unwrap_or(1).max(1) - 1) * page_size;
@@ -2231,10 +2284,9 @@ pub(crate) struct GetDailyChallengeTotalScoreRankingsResponse {
 }
 
 pub(crate) async fn get_daily_challenge_total_score_rankings(
-  Query(LoadUserTotalScoreRankingsQueryParams {
-    page,
-    fetch_missing_usernames: _,
-  }): Query<LoadUserTotalScoreRankingsQueryParams>,
+  Query(LoadUserTotalScoreRankingsQueryParams { page, .. }): Query<
+    LoadUserTotalScoreRankingsQueryParams,
+  >,
 ) -> Result<Json<GetDailyChallengeTotalScoreRankingsResponse>, APIError> {
   let rankings = get_user_total_score_rankings(false).await?.load();
   let page_size = 50;
