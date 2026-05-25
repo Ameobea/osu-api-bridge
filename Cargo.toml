@@ -37,9 +37,12 @@ plotters = "0.3.7"
 image = { version = "0.25.9", default-features = false, features = ["png", "rayon"] }
 rand = "0.9"
 num_cpus = "1.17.0"
+resvg = { version = "0.47.0", optional = true }
+base62 = { version = "2.2.4", optional = true }
+base64 = { version = "0.22.1", optional = true }
 
 [features]
 sql = ["sqlx"]
 simulate_play = ["sql", "flate2", "rosu-pp", "rosu-mods", "rosu-v2"]
-daily_challenge = ["sql", "rosu-v2"]
+daily_challenge = ["sql", "rosu-v2", "resvg", "base62", "base64"]
 default = ["simulate_play", "daily_challenge"]

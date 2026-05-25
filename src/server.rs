@@ -50,6 +50,8 @@ mod analysis;
 mod analytics;
 #[cfg(feature = "daily_challenge")]
 mod daily_challenge;
+#[cfg(feature = "daily_challenge")]
+mod embed;
 #[cfg(feature = "sql")]
 mod osutrack_update;
 #[cfg(feature = "simulate_play")]
@@ -836,6 +838,18 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
           "get_latest_daily_challenge_day_id",
           daily_challenge::get_latest_daily_challenge_day_id,
         )),
+      )
+      .route(
+        "/daily-challenge/embed",
+        axum::routing::post(instrument_handler("create_embed", embed::create_embed)),
+      )
+      .route(
+        "/daily-challenge/embed/preview",
+        axum::routing::post(instrument_handler("preview_embed", embed::preview_embed)),
+      )
+      .route(
+        "/daily-challenge/embed/{user_id}/{file}",
+        axum::routing::get(instrument_handler("get_embed", embed::get_embed)),
       )
   }
 

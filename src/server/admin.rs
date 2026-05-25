@@ -451,8 +451,8 @@ pub(super) struct ReviewDeletedUsersQueryParams {
 ///  3. **Primary signal — pp ratio**: `current_pp / historical_max_pp`.
 ///     - ≥ `min_pp_ratio` (default 0.75) → "restore" (pp is intact, API blip)
 ///     - < `min_pp_ratio` → "leave_deleted" (pp dropped sharply, likely score reset on unban)
-///  4. **Fallback** (no pp history, fully-deleted user only): fetches current top 100 plays
-///     and checks beatmap-ID overlap with deleted hiscores.
+///  4. **Fallback** (no pp history, fully-deleted user only): fetches current top 100 plays and
+///     checks beatmap-ID overlap with deleted hiscores.
 ///  5. Partially-restored users with no pp history → "uncertain" (manual review needed).
 ///
 /// Set `dry_run=false` to actually restore the recommended users.
@@ -489,19 +489,11 @@ pub(super) async fn review_deleted_users(
   //
   // Using UNION (not UNION ALL) dedups users that appear in both gaps.
   let users_with_gaps: Vec<i64> = sqlx::query_scalar(
-    "SELECT user FROM ( \
-       SELECT DISTINCT hud.user \
-       FROM hiscore_updates_deleted hud \
-       LEFT JOIN hiscore_updates hu \
-         ON hu.user = hud.user AND hu.beatmap_id = hud.beatmap_id AND hu.score_time = hud.score_time \
-       WHERE hud.mode = ? AND hu.user IS NULL \
-       UNION \
-       SELECT DISTINCT ud.user \
-       FROM updates_deleted ud \
-       LEFT JOIN updates u \
-         ON u.user = ud.user AND u.timestamp = ud.timestamp AND u.mode = ud.mode \
-       WHERE ud.mode = ? AND u.user IS NULL \
-     ) combined",
+    "SELECT user FROM ( SELECT DISTINCT hud.user FROM hiscore_updates_deleted hud LEFT JOIN \
+     hiscore_updates hu ON hu.user = hud.user AND hu.beatmap_id = hud.beatmap_id AND \
+     hu.score_time = hud.score_time WHERE hud.mode = ? AND hu.user IS NULL UNION SELECT DISTINCT \
+     ud.user FROM updates_deleted ud LEFT JOIN updates u ON u.user = ud.user AND u.timestamp = \
+     ud.timestamp AND u.mode = ud.mode WHERE ud.mode = ? AND u.user IS NULL ) combined",
   )
   .bind(mode)
   .bind(mode)
@@ -537,10 +529,9 @@ pub(super) async fn review_deleted_users(
 
     // ── DB gap counts ────────────────────────────────────────────────────────
     let missing_hiscore_count: i64 = sqlx::query_scalar(
-      "SELECT COUNT(*) FROM hiscore_updates_deleted hud \
-       LEFT JOIN hiscore_updates hu \
-         ON hu.user = hud.user AND hu.beatmap_id = hud.beatmap_id AND hu.score_time = hud.score_time \
-       WHERE hud.user = ? AND hud.mode = ? AND hu.user IS NULL",
+      "SELECT COUNT(*) FROM hiscore_updates_deleted hud LEFT JOIN hiscore_updates hu ON hu.user = \
+       hud.user AND hu.beatmap_id = hud.beatmap_id AND hu.score_time = hud.score_time WHERE \
+       hud.user = ? AND hud.mode = ? AND hu.user IS NULL",
     )
     .bind(user_id)
     .bind(mode)
@@ -549,10 +540,9 @@ pub(super) async fn review_deleted_users(
     .unwrap_or(0);
 
     let missing_update_count: i64 = sqlx::query_scalar(
-      "SELECT COUNT(*) FROM updates_deleted ud \
-       LEFT JOIN updates u \
-         ON u.user = ud.user AND u.timestamp = ud.timestamp AND u.mode = ud.mode \
-       WHERE ud.user = ? AND ud.mode = ? AND u.user IS NULL",
+      "SELECT COUNT(*) FROM updates_deleted ud LEFT JOIN updates u ON u.user = ud.user AND \
+       u.timestamp = ud.timestamp AND u.mode = ud.mode WHERE ud.user = ? AND ud.mode = ? AND \
+       u.user IS NULL",
     )
     .bind(user_id)
     .bind(mode)
@@ -572,15 +562,14 @@ pub(super) async fn review_deleted_users(
     // ── Historical max pp ────────────────────────────────────────────────────
     // Pull from both deleted and (for partial restores) active updates tables so that
     // recent post-restore improvements don't lower the effective baseline.
-    let deleted_max_pp: Option<f64> = sqlx::query_scalar(
-      "SELECT MAX(pp_raw) FROM updates_deleted WHERE user = ? AND mode = ?",
-    )
-    .bind(user_id)
-    .bind(mode)
-    .fetch_one(pool)
-    .await
-    .ok()
-    .flatten();
+    let deleted_max_pp: Option<f64> =
+      sqlx::query_scalar("SELECT MAX(pp_raw) FROM updates_deleted WHERE user = ? AND mode = ?")
+        .bind(user_id)
+        .bind(mode)
+        .fetch_one(pool)
+        .await
+        .ok()
+        .flatten();
 
     let active_max_pp: Option<f64> = if partially_restored {
       sqlx::query_scalar("SELECT MAX(pp_raw) FROM updates WHERE user = ? AND mode = ?")
@@ -652,8 +641,8 @@ pub(super) async fn review_deleted_users(
     let username = &user_info.username;
 
     info!(
-      "  user id={user_id} username={username}: exists; \
-       current_pp={current_pp:?} historical_max_pp={historical_max_pp:?}"
+      "  user id={user_id} username={username}: exists; current_pp={current_pp:?} \
+       historical_max_pp={historical_max_pp:?}"
     );
 
     // ── Step 2: primary signal — pp ratio ───────────────────────────────────
@@ -662,14 +651,14 @@ pub(super) async fn review_deleted_users(
         let ratio = curr / hist;
         let recommendation = if ratio >= min_pp_ratio {
           info!(
-            "  user id={user_id} username={username}: pp_ratio={ratio:.3} \
-             ({curr:.1}/{hist:.1}) ≥ {min_pp_ratio} → restore"
+            "  user id={user_id} username={username}: pp_ratio={ratio:.3} ({curr:.1}/{hist:.1}) ≥ \
+             {min_pp_ratio} → restore"
           );
           "restore"
         } else {
           info!(
-            "  user id={user_id} username={username}: pp_ratio={ratio:.3} \
-             ({curr:.1}/{hist:.1}) < {min_pp_ratio} → leave_deleted (likely score reset)"
+            "  user id={user_id} username={username}: pp_ratio={ratio:.3} ({curr:.1}/{hist:.1}) < \
+             {min_pp_ratio} → leave_deleted (likely score reset)"
           );
           "leave_deleted"
         };
@@ -713,8 +702,8 @@ pub(super) async fn review_deleted_users(
     // Partially-restored users without pp history can't be assessed automatically.
     if partially_restored {
       info!(
-        "  user id={user_id} username={username}: no pp history for partially-restored \
-         user → uncertain (manual review needed)"
+        "  user id={user_id} username={username}: no pp history for partially-restored user → \
+         uncertain (manual review needed)"
       );
       results.push(DeletedUserReviewResult {
         user_id,
@@ -735,18 +724,16 @@ pub(super) async fn review_deleted_users(
     }
 
     info!(
-      "  user id={user_id} username={username}: no pp history; falling back to beatmap \
-       overlap check"
+      "  user id={user_id} username={username}: no pp history; falling back to beatmap overlap \
+       check"
     );
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let missing_beatmap_ids: Vec<i64> = sqlx::query_scalar(
-      "SELECT DISTINCT hud.beatmap_id \
-       FROM hiscore_updates_deleted hud \
-       LEFT JOIN hiscore_updates hu \
-         ON hu.user = hud.user AND hu.beatmap_id = hud.beatmap_id AND hu.score_time = hud.score_time \
-       WHERE hud.user = ? AND hud.mode = ? AND hu.user IS NULL",
+      "SELECT DISTINCT hud.beatmap_id FROM hiscore_updates_deleted hud LEFT JOIN hiscore_updates \
+       hu ON hu.user = hud.user AND hu.beatmap_id = hud.beatmap_id AND hu.score_time = \
+       hud.score_time WHERE hud.user = ? AND hud.mode = ? AND hu.user IS NULL",
     )
     .bind(user_id)
     .bind(mode)
@@ -754,35 +741,34 @@ pub(super) async fn review_deleted_users(
     .await
     .unwrap_or_default();
 
-    let current_plays =
-      match fetch_user_hiscores(user_id as u64, ruleset, Some(100), Some(0)).await {
-        Ok(plays) => plays,
-        Err(err) => {
-          error!(
-            "  user id={user_id} username={username}: error fetching hiscores for fallback \
-             beatmap check: {err:?}"
-          );
-          results.push(DeletedUserReviewResult {
-            user_id,
-            username: Some(username.clone()),
-            exists_on_osu: true,
-            partially_restored: false,
-            missing_hiscore_count: missing_hiscore_count as usize,
-            missing_update_count: missing_update_count as usize,
-            current_pp,
-            historical_max_pp,
-            pp_ratio: None,
-            current_hiscore_count: 0,
-            matching_beatmap_count: 0,
-            recommendation: "api_error".to_owned(),
-            restored: false,
-          });
-          continue;
-        },
-      };
+    let current_plays = match fetch_user_hiscores(user_id as u64, ruleset, Some(100), Some(0)).await
+    {
+      Ok(plays) => plays,
+      Err(err) => {
+        error!(
+          "  user id={user_id} username={username}: error fetching hiscores for fallback beatmap \
+           check: {err:?}"
+        );
+        results.push(DeletedUserReviewResult {
+          user_id,
+          username: Some(username.clone()),
+          exists_on_osu: true,
+          partially_restored: false,
+          missing_hiscore_count: missing_hiscore_count as usize,
+          missing_update_count: missing_update_count as usize,
+          current_pp,
+          historical_max_pp,
+          pp_ratio: None,
+          current_hiscore_count: 0,
+          matching_beatmap_count: 0,
+          recommendation: "api_error".to_owned(),
+          restored: false,
+        });
+        continue;
+      },
+    };
 
-    let current_beatmap_ids: HashSet<i64> =
-      current_plays.iter().map(|p| p.beatmap_id).collect();
+    let current_beatmap_ids: HashSet<i64> = current_plays.iter().map(|p| p.beatmap_id).collect();
     let matching_count = missing_beatmap_ids
       .iter()
       .filter(|&&bm| current_beatmap_ids.contains(&bm))
@@ -800,14 +786,14 @@ pub(super) async fn review_deleted_users(
       "leave_deleted"
     } else if matching_count >= min_matching {
       info!(
-        "  user id={user_id} username={username}: {matching_count} matching beatmaps ≥ \
-         threshold {min_matching} → restore"
+        "  user id={user_id} username={username}: {matching_count} matching beatmaps ≥ threshold \
+         {min_matching} → restore"
       );
       "restore"
     } else {
       info!(
-        "  user id={user_id} username={username}: {matching_count} matching beatmaps < \
-         threshold {min_matching} → uncertain"
+        "  user id={user_id} username={username}: {matching_count} matching beatmaps < threshold \
+         {min_matching} → uncertain"
       );
       "uncertain"
     };
@@ -846,13 +832,24 @@ pub(super) async fn review_deleted_users(
   }
 
   info!(
-    "review_deleted_users complete: total={} restore={} leave_deleted={} uncertain={} \
-     api_error={}",
+    "review_deleted_users complete: total={} restore={} leave_deleted={} uncertain={} api_error={}",
     results.len(),
-    results.iter().filter(|r| r.recommendation == "restore").count(),
-    results.iter().filter(|r| r.recommendation == "leave_deleted").count(),
-    results.iter().filter(|r| r.recommendation == "uncertain").count(),
-    results.iter().filter(|r| r.recommendation == "api_error").count(),
+    results
+      .iter()
+      .filter(|r| r.recommendation == "restore")
+      .count(),
+    results
+      .iter()
+      .filter(|r| r.recommendation == "leave_deleted")
+      .count(),
+    results
+      .iter()
+      .filter(|r| r.recommendation == "uncertain")
+      .count(),
+    results
+      .iter()
+      .filter(|r| r.recommendation == "api_error")
+      .count(),
   );
 
   Ok(Json(results))

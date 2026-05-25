@@ -855,10 +855,7 @@ pub struct UserInfoStatistics {
   pub pp: Option<f64>,
 }
 
-pub async fn fetch_user_info(
-  user_id: u64,
-  mode: Ruleset,
-) -> Result<Option<UserInfo>, APIError> {
+pub async fn fetch_user_info(user_id: u64, mode: Ruleset) -> Result<Option<UserInfo>, APIError> {
   match fetch_v2_user_for_osutrack(&user_id.to_string(), mode).await? {
     Some(u) => Ok(Some(UserInfo {
       username: u.username,

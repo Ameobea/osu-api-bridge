@@ -1384,9 +1384,9 @@ async fn load_user_first_place_rankings() -> Result<UserPercentRankings, APIErro
 
 #[derive(Clone, Default, Serialize)]
 pub(crate) struct Histogram {
-  min: f32,
-  max: f32,
-  buckets: Vec<usize>,
+  pub(crate) min: f32,
+  pub(crate) max: f32,
+  pub(crate) buckets: Vec<usize>,
 }
 
 #[derive(Clone, Serialize)]
@@ -1660,39 +1660,39 @@ pub(crate) async fn get_user_daily_challenge_for_day(
 
 #[derive(Default, Serialize)]
 pub(crate) struct Streaks {
-  cur_daily_streak: usize,
-  cur_weekly_streak: usize,
-  best_daily_streak: usize,
-  best_weekly_streak: usize,
-  cur_top_1_percent_streak: usize,
-  best_top_1_percent_streak: usize,
-  best_top_1_percent_streak_span: Option<(usize, usize)>,
-  cur_top_10_percent_streak: usize,
-  best_top_10_percent_streak: usize,
-  best_top_10_percent_streak_span: Option<(usize, usize)>,
-  cur_top_50_percent_streak: usize,
-  best_top_50_percent_streak: usize,
-  best_top_50_percent_streak_span: Option<(usize, usize)>,
+  pub(crate) cur_daily_streak: usize,
+  pub(crate) cur_weekly_streak: usize,
+  pub(crate) best_daily_streak: usize,
+  pub(crate) best_weekly_streak: usize,
+  pub(crate) cur_top_1_percent_streak: usize,
+  pub(crate) best_top_1_percent_streak: usize,
+  pub(crate) best_top_1_percent_streak_span: Option<(usize, usize)>,
+  pub(crate) cur_top_10_percent_streak: usize,
+  pub(crate) best_top_10_percent_streak: usize,
+  pub(crate) best_top_10_percent_streak_span: Option<(usize, usize)>,
+  pub(crate) cur_top_50_percent_streak: usize,
+  pub(crate) best_top_50_percent_streak: usize,
+  pub(crate) best_top_50_percent_streak_span: Option<(usize, usize)>,
 }
 
 #[derive(Default, Serialize)]
 pub(crate) struct BestPlacement {
-  day_id: usize,
-  score: usize,
-  rank: usize,
-  pp: Option<f32>,
-  total_rankings: usize,
-  percentile: f32,
+  pub(crate) day_id: usize,
+  pub(crate) score: usize,
+  pub(crate) rank: usize,
+  pub(crate) pp: Option<f32>,
+  pub(crate) total_rankings: usize,
+  pub(crate) percentile: f32,
 }
 
 #[derive(Default, Serialize)]
 pub(crate) struct TotalScoreStats {
   /// The sum of all scores for all daily challenges
-  total_score_sum: usize,
+  pub(crate) total_score_sum: usize,
   /// Rank (1 being the best) of the sum of all scores for all daily challenges compared to all
   /// other users
-  total_score_rank: usize,
-  total_score_percentile: f32,
+  pub(crate) total_score_rank: usize,
+  pub(crate) total_score_percentile: f32,
 }
 
 #[derive(Default, Serialize)]
@@ -1718,6 +1718,8 @@ pub(crate) struct DailyChallengeUserStats {
   pub best_placement_score: Option<BestPlacement>,
   pub best_placement_pp: Option<BestPlacement>,
   pub most_used_mods: Vec<(Option<Mod>, usize)>,
+  /// the mod combination the user runs most often (empty = "No Mod")
+  pub most_used_mod_combo: Vec<Mod>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1945,9 +1947,9 @@ async fn compute_streaks(
   })
 }
 
-pub(crate) async fn get_user_daily_challenge_stats(
-  Path(user_id): Path<usize>,
-) -> Result<Json<DailyChallengeUserStats>, APIError> {
+pub(crate) async fn compute_user_daily_challenge_stats(
+  user_id: usize,
+) -> Result<DailyChallengeUserStats, APIError> {
   let scores = sqlx::query_as!(
     MinimalUserDailyChallengeScore,
     "SELECT day_id, user_rank, total_score, ended_at, mods, pp FROM daily_challenge_rankings \
@@ -1970,10 +1972,10 @@ pub(crate) async fn get_user_daily_challenge_stats(
   let stats = get_daily_challenge_stats().await?.load();
 
   if scores.is_empty() {
-    return Ok(Json(DailyChallengeUserStats {
+    return Ok(DailyChallengeUserStats {
       total_challenge_count: stats.len(),
       ..Default::default()
-    }));
+    });
   }
 
   let mut total_score_sum = 0;
@@ -2054,6 +2056,8 @@ pub(crate) async fn get_user_daily_challenge_stats(
   let last_daily_challenge_day_id = stats.keys().max().copied().unwrap();
   let streaks = compute_streaks(&scores, last_daily_challenge_day_id).await?;
   let mut most_used_mods = FxHashMap::default();
+  // mod combo -> (count, most_recent_day_id), to pick the user's modal combo
+  let mut mod_combos: FxHashMap<Vec<Mod>, (usize, usize)> = FxHashMap::default();
 
   for score in &scores {
     total_score_sum += score.total_score as usize;
@@ -2131,20 +2135,31 @@ pub(crate) async fn get_user_daily_challenge_stats(
 
     match &score.mods {
       Some(mods) => match serde_json::from_slice::<Vec<Mod>>(mods) {
-        Ok(mods) if mods.is_empty() => {
-          most_used_mods
-            .entry(None)
-            .or_insert((0, score.day_id as usize))
-            .0 += 1;
+        Ok(mods) => {
+          // sort so mod order doesn't fragment the count
+          let mut combo = mods.clone();
+          combo.sort_unstable_by(|a, b| a.acronym.cmp(&b.acronym));
+          let ce = mod_combos
+            .entry(combo)
+            .or_insert((0, score.day_id as usize));
+          ce.0 += 1;
+          ce.1 = ce.1.max(score.day_id as usize);
+
+          if mods.is_empty() {
+            most_used_mods
+              .entry(None)
+              .or_insert((0, score.day_id as usize))
+              .0 += 1;
+          } else {
+            for m in mods {
+              let entry = most_used_mods
+                .entry(Some(m))
+                .or_insert((0, score.day_id as usize));
+              entry.0 += 1;
+              entry.1 = entry.1.max(score.day_id as usize);
+            }
+          }
         },
-        Ok(mods) =>
-          for m in mods {
-            let entry = most_used_mods
-              .entry(Some(m))
-              .or_insert((0, score.day_id as usize));
-            entry.0 += 1;
-            entry.1 = entry.1.max(score.day_id as usize);
-          },
         Err(_) => {
           error!(
             "Failed to parse mods for daily challenge score for user={user_id} day_id={}; found: \
@@ -2166,8 +2181,13 @@ pub(crate) async fn get_user_daily_challenge_stats(
     .into_iter()
     .map(|(m, (count, _))| (m, count))
     .collect();
+  let most_used_mod_combo = mod_combos
+    .into_iter()
+    .max_by_key(|(_, (count, recent))| (*count, *recent))
+    .map(|(combo, _)| combo)
+    .unwrap_or_default();
 
-  Ok(Json(DailyChallengeUserStats {
+  Ok(DailyChallengeUserStats {
     total_participation: scores.len(),
     total_challenge_count: stats.len(),
     total_score_stats: TotalScoreStats {
@@ -2215,7 +2235,52 @@ pub(crate) async fn get_user_daily_challenge_stats(
       Some(best_placement_pp)
     },
     most_used_mods,
-  }))
+    most_used_mod_combo,
+  })
+}
+
+/// day-of-month (1-based) -> percentile (`user_rank / total_scores * 100`) for the given month.
+pub(crate) async fn user_month_percentiles(
+  user_id: u64,
+  year: u32,
+  month: u32,
+) -> Result<FxHashMap<u32, f32>, APIError> {
+  let ym = (year * 10000 + month * 100) as i64;
+  let rows = sqlx::query!(
+    "SELECT day_id, user_rank FROM daily_challenge_rankings WHERE user_id = ? AND day_id BETWEEN \
+     ? AND ?",
+    user_id as i64,
+    ym + 1,
+    ym + 31,
+  )
+  .fetch_all(db_pool())
+  .await
+  .map_err(|err| {
+    error!("Failed to load month percentiles for user {user_id}: {err}");
+    APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: "database error".to_owned(),
+    }
+  })?;
+
+  let stats = get_daily_challenge_stats().await?.load();
+  let mut out = FxHashMap::with_capacity_and_hasher(rows.len(), Default::default());
+  for row in rows {
+    let day_id = row.day_id as usize;
+    let total = stats.get(&day_id).map(|s| s.total_scores).unwrap_or(0);
+    if total == 0 {
+      continue;
+    }
+    let dom = (day_id % 100) as u32;
+    out.insert(dom, row.user_rank as f32 / total as f32 * 100.);
+  }
+  Ok(out)
+}
+
+pub(crate) async fn get_user_daily_challenge_stats(
+  Path(user_id): Path<usize>,
+) -> Result<Json<DailyChallengeUserStats>, APIError> {
+  Ok(Json(compute_user_daily_challenge_stats(user_id).await?))
 }
 
 pub(crate) async fn get_daily_challenge_stats_for_day(
@@ -2403,4 +2468,17 @@ pub(crate) async fn get_latest_daily_challenge_day_id() -> Result<Json<usize>, A
     })?
     .expect("looks like the database has been emptied");
   Ok(Json(day_id as usize))
+}
+
+pub(crate) async fn latest_day_id() -> Result<usize, APIError> {
+  get_daily_challenge_stats()
+    .await?
+    .load()
+    .keys()
+    .max()
+    .copied()
+    .ok_or_else(|| APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: "No daily challenge data loaded".to_owned(),
+    })
 }

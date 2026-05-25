@@ -161,15 +161,14 @@ fn format_decimal_like_mysqli(v: f64) -> String {
   }
 }
 
-const SELECT_UPDATES_COLS: &str = "CAST(id AS SIGNED) AS id, CAST(user AS SIGNED) AS user, \
-  CAST(count300 AS SIGNED) AS count300, CAST(count100 AS SIGNED) AS count100, \
-  CAST(count50 AS SIGNED) AS count50, CAST(playcount AS SIGNED) AS playcount, \
-  CAST(ranked_score AS SIGNED) AS ranked_score, CAST(total_score AS SIGNED) AS total_score, \
-  CAST(pp_rank AS SIGNED) AS pp_rank, CAST(level AS DOUBLE) AS level, \
-  CAST(pp_raw AS DOUBLE) AS pp_raw, CAST(accuracy AS DOUBLE) AS accuracy, \
-  CAST(count_rank_ss AS SIGNED) AS count_rank_ss, CAST(count_rank_s AS SIGNED) AS count_rank_s, \
-  CAST(count_rank_a AS SIGNED) AS count_rank_a, CAST(timestamp AS DATETIME) AS timestamp, \
-  CAST(mode AS SIGNED) AS mode";
+const SELECT_UPDATES_COLS: &str =
+  "CAST(id AS SIGNED) AS id, CAST(user AS SIGNED) AS user, CAST(count300 AS SIGNED) AS count300, \
+   CAST(count100 AS SIGNED) AS count100, CAST(count50 AS SIGNED) AS count50, CAST(playcount AS \
+   SIGNED) AS playcount, CAST(ranked_score AS SIGNED) AS ranked_score, CAST(total_score AS \
+   SIGNED) AS total_score, CAST(pp_rank AS SIGNED) AS pp_rank, CAST(level AS DOUBLE) AS level, \
+   CAST(pp_raw AS DOUBLE) AS pp_raw, CAST(accuracy AS DOUBLE) AS accuracy, CAST(count_rank_ss AS \
+   SIGNED) AS count_rank_ss, CAST(count_rank_s AS SIGNED) AS count_rank_s, CAST(count_rank_a AS \
+   SIGNED) AS count_rank_a, CAST(timestamp AS DATETIME) AS timestamp, CAST(mode AS SIGNED) AS mode";
 
 #[derive(Clone, Copy)]
 struct DerivedSnapshotFields {
@@ -283,9 +282,7 @@ async fn apply_updates_row(
   let last = recent.first();
   let second_last = recent.get(1);
   let should_bump_timestamp = match (last, second_last) {
-    (Some(last), Some(second_last)) => {
-      rows_match(last, second_last) && derived.matches(last)
-    },
+    (Some(last), Some(second_last)) => rows_match(last, second_last) && derived.matches(last),
     _ => false,
   };
 
@@ -370,8 +367,8 @@ async fn diff_and_insert_hiscores(
   }
 
   let existing: Vec<ExistingHiscore> = sqlx::query_as(
-    "SELECT CAST(beatmap_id AS SIGNED) AS beatmap_id, CAST(score AS SIGNED) AS score, \
-     CAST(pp AS DOUBLE) AS pp FROM hiscore_updates WHERE user = ? AND mode = ?",
+    "SELECT CAST(beatmap_id AS SIGNED) AS beatmap_id, CAST(score AS SIGNED) AS score, CAST(pp AS \
+     DOUBLE) AS pp FROM hiscore_updates WHERE user = ? AND mode = ?",
   )
   .bind(osu_id)
   .bind(mode_val)
@@ -469,10 +466,10 @@ async fn upsert_matchmaking_pools(
 ) -> Result<(), APIError> {
   for stat in stats {
     sqlx::query(
-      "INSERT INTO matchmaking_pools (id, name, ruleset_id, variant_id, active, last_seen) \
-       VALUES (?, ?, ?, ?, ?, NOW()) ON DUPLICATE KEY UPDATE name = VALUES(name), \
-       ruleset_id = VALUES(ruleset_id), variant_id = VALUES(variant_id), \
-       active = VALUES(active), last_seen = NOW()",
+      "INSERT INTO matchmaking_pools (id, name, ruleset_id, variant_id, active, last_seen) VALUES \
+       (?, ?, ?, ?, ?, NOW()) ON DUPLICATE KEY UPDATE name = VALUES(name), ruleset_id = \
+       VALUES(ruleset_id), variant_id = VALUES(variant_id), active = VALUES(active), last_seen = \
+       NOW()",
     )
     .bind(stat.pool.id)
     .bind(&stat.pool.name)
@@ -516,13 +513,11 @@ async fn write_matchmaking_updates(
 
   for stat in stats {
     let recent: Vec<MatchmakingRow> = sqlx::query_as(
-      "SELECT CAST(id AS SIGNED) AS id, CAST(rating AS DOUBLE) AS rating, \
-       CAST(`rank` AS SIGNED) AS `rank`, CAST(plays AS SIGNED) AS plays, \
-       CAST(first_placements AS SIGNED) AS first_placements, \
-       CAST(total_points AS SIGNED) AS total_points, \
-       CAST(is_rating_provisional AS SIGNED) AS is_rating_provisional \
-       FROM matchmaking_updates WHERE user = ? AND mode = ? AND pool_id = ? \
-       ORDER BY timestamp DESC LIMIT 2",
+      "SELECT CAST(id AS SIGNED) AS id, CAST(rating AS DOUBLE) AS rating, CAST(`rank` AS SIGNED) \
+       AS `rank`, CAST(plays AS SIGNED) AS plays, CAST(first_placements AS SIGNED) AS \
+       first_placements, CAST(total_points AS SIGNED) AS total_points, CAST(is_rating_provisional \
+       AS SIGNED) AS is_rating_provisional FROM matchmaking_updates WHERE user = ? AND mode = ? \
+       AND pool_id = ? ORDER BY timestamp DESC LIMIT 2",
     )
     .bind(osu_id)
     .bind(mode_val)
@@ -577,8 +572,7 @@ async fn write_matchmaking_updates(
     } else {
       sqlx::query(
         "INSERT INTO matchmaking_updates (user, mode, pool_id, rating, `rank`, plays, \
-         first_placements, total_points, is_rating_provisional) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         first_placements, total_points, is_rating_provisional) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .bind(osu_id)
       .bind(mode_val)
@@ -611,8 +605,8 @@ async fn enqueue_fetch_queue(
   mode_val: u8,
 ) -> Result<(), APIError> {
   sqlx::query(
-    "INSERT INTO matchmaking_fetch_queue (user, mode, enqueued_at) VALUES (?, ?, NOW()) \
-     ON DUPLICATE KEY UPDATE enqueued_at = VALUES(enqueued_at)",
+    "INSERT INTO matchmaking_fetch_queue (user, mode, enqueued_at) VALUES (?, ?, NOW()) ON \
+     DUPLICATE KEY UPDATE enqueued_at = VALUES(enqueued_at)",
   )
   .bind(osu_id)
   .bind(mode_val)
@@ -711,8 +705,7 @@ pub(super) async fn osutrack_update(
     internal_error("Failed to start DB transaction")
   })?;
 
-  let (previous_row, current_row) =
-    apply_updates_row(&mut txn, osu_id, mode_val, derived).await?;
+  let (previous_row, current_row) = apply_updates_row(&mut txn, osu_id, mode_val, derived).await?;
 
   let new_hiscores = diff_and_insert_hiscores(&mut txn, osu_id, mode_val, hiscores_v1).await?;
   upsert_user_row(&mut txn, osu_id, &v2_user.username).await?;

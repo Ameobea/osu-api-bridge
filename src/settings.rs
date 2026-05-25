@@ -11,7 +11,13 @@ pub struct SqlSettings {
 #[settings]
 pub struct DailyChallengeSettings {
   pub admin_token: String,
+  /// dir for cached rendered embeds
+  #[serde(default = "default_embed_cache_dir")]
+  pub embed_cache_dir: String,
 }
+
+#[cfg(feature = "daily_challenge")]
+fn default_embed_cache_dir() -> String { "./embed_cache".to_owned() }
 
 #[settings]
 pub struct ServerSettings {
