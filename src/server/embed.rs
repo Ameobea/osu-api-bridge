@@ -213,7 +213,7 @@ fn config_hash(config: &EmbedConfig) -> String {
 
 /// bump on any renderer change; folded into cache filenames + ETags so old renders are swept by
 /// `prune_siblings`
-const RENDER_VERSION: u32 = 9;
+const RENDER_VERSION: u32 = 10;
 
 const W: f32 = 480.; // single-column width (no feature panel)
 const PAD_X: f32 = 14.;
@@ -262,6 +262,15 @@ fn commafy(n: usize) -> String {
   out
 }
 
+/// a count with its global rank appended, e.g. "92 (#829)"; just the count when the rank is
+/// unknown.
+fn count_with_rank(count: usize, rank: Option<usize>) -> String {
+  match rank {
+    Some(r) => format!("{} (#{})", commafy(count), commafy(r)),
+    None => commafy(count),
+  }
+}
+
 fn esc(s: &str) -> String {
   s.replace('&', "&amp;")
     .replace('<', "&lt;")
@@ -288,7 +297,7 @@ fn fmt_rate(r: f64) -> String {
 /// the user's modal mod combination, e.g. "DT 1.3x, HD" (clock-rate appended when present).
 fn fmt_mod_combo(mods: &[Mod]) -> String {
   if mods.is_empty() {
-    return "No Mod".into();
+    return "Nomod".to_owned();
   }
   mods
     .iter()
@@ -423,10 +432,22 @@ fn resolve_stat(k: &StatKey, cfg: &EmbedConfig, s: &DailyChallengeUserStats) -> 
       },
       None => plain("Highest PP", dash()),
     },
-    StatKey::Top50Count => plain("Top 50%", commafy(s.top_50_percent_count)),
-    StatKey::Top10Count => plain("Top 10%", commafy(s.top_10_percent_count)),
-    StatKey::Top1Count => plain("Top 1%", commafy(s.top_1_percent_count)),
-    StatKey::FirstPlaceCount => plain("1st Places", commafy(s.first_place_count)),
+    StatKey::Top50Count => plain(
+      "Top 50% Count",
+      count_with_rank(s.top_50_percent_count, s.top_50_percent_rank),
+    ),
+    StatKey::Top10Count => plain(
+      "Top 10% Count",
+      count_with_rank(s.top_10_percent_count, s.top_10_percent_rank),
+    ),
+    StatKey::Top1Count => plain(
+      "Top 1% Count",
+      count_with_rank(s.top_1_percent_count, s.top_1_percent_rank),
+    ),
+    StatKey::FirstPlaceCount => plain(
+      "1st Place Count",
+      count_with_rank(s.first_place_count, s.first_place_rank),
+    ),
     StatKey::Top1Streak => plain("Best Top 1% Streak", commafy(st.best_top_1_percent_streak)),
     StatKey::Top10Streak => plain(
       "Best Top 10% Streak",
