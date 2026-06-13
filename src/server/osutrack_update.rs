@@ -262,7 +262,7 @@ async fn apply_updates_row(
     "SELECT {SELECT_UPDATES_COLS} FROM updates WHERE user = ? AND mode = ? ORDER BY timestamp \
      DESC LIMIT 2"
   );
-  let recent: Vec<UpdateRow> = sqlx::query_as(&select_recent)
+  let recent: Vec<UpdateRow> = sqlx::query_as(sqlx::AssertSqlSafe(select_recent))
     .bind(osu_id)
     .bind(mode_val)
     .fetch_all(&mut **txn)
@@ -298,7 +298,7 @@ async fn apply_updates_row(
       })?;
     // Re-read the row so `timestamp` reflects NOW() in the response.
     let select_by_id = format!("SELECT {SELECT_UPDATES_COLS} FROM updates WHERE id = ?");
-    let refreshed: Option<UpdateRow> = sqlx::query_as(&select_by_id)
+    let refreshed: Option<UpdateRow> = sqlx::query_as(sqlx::AssertSqlSafe(select_by_id))
       .bind(last.id)
       .fetch_optional(&mut **txn)
       .await
@@ -336,7 +336,7 @@ async fn apply_updates_row(
     })?;
     let new_id = insert_res.last_insert_id() as i64;
     let select_by_id = format!("SELECT {SELECT_UPDATES_COLS} FROM updates WHERE id = ?");
-    sqlx::query_as(&select_by_id)
+    sqlx::query_as(sqlx::AssertSqlSafe(select_by_id))
       .bind(new_id)
       .fetch_optional(&mut **txn)
       .await

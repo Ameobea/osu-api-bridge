@@ -13,29 +13,28 @@ axum = { version = "0.8", features = ["tower-log"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "charset", "http2", "system-proxy", "json", "form"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_path_to_error = "0.1"
 lazy_static = "1.4"
 chrono = { version = "0.4", features = ["serde"] }
 float-ord = "0.3"
-sqlx = { version = "0.8", features = ["runtime-tokio", "macros", "mysql", "chrono", "json"], default-features = false, optional = true }
+sqlx = { version = "0.9", features = ["runtime-tokio", "macros", "mysql", "chrono", "json"], default-features = false, optional = true }
 flate2 = { version = "1.0", optional = true }
-rosu-pp = { version = "3.1", optional = true }
-rosu-mods = { version = "0.3", optional = true }
-rosu-v2 = { version = "0.11", optional = true }
+rosu-pp = { version = "4.0", optional = true }
+rosu-mods = { version = "0.4", optional = true }
 arc-swap = "1.7.1"
 fxhash = "0.2.1"
 pin-project = "1.1.5"
 dashmap = "6.1.0"
 moka = { version = "0.12.11", features = ["sync"] }
-sha2 = "0.10.9"
-nalgebra = "0.34.1"
-pco = "0.4.7"
+sha2 = "0.11"
+hex = "0.4"
+pco = "1.0"
 plotters = "0.3.7"
 image = { version = "0.25.9", default-features = false, features = ["png", "rayon"] }
-rand = "0.9"
+rand = "0.10"
 num_cpus = "1.17.0"
 resvg = { version = "0.47.0", optional = true }
 base62 = { version = "2.2.4", optional = true }
@@ -43,6 +42,6 @@ base64 = { version = "0.22.1", optional = true }
 
 [features]
 sql = ["sqlx"]
-simulate_play = ["sql", "flate2", "rosu-pp", "rosu-mods", "rosu-v2"]
-daily_challenge = ["sql", "rosu-v2", "resvg", "base62", "base64"]
+simulate_play = ["sql", "flate2", "rosu-pp", "rosu-mods"]
+daily_challenge = ["sql", "resvg", "base62", "base64"]
 default = ["simulate_play", "daily_challenge"]

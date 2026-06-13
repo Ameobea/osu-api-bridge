@@ -37,7 +37,7 @@ fn verify_payload(
   }
   hasher.update(salt.as_bytes());
   let result = hasher.finalize();
-  let hash = format!("{:x}", result);
+  let hash = hex::encode(result);
 
   if hash != verification {
     warn!("Invalid analytics verification hash: expected {hash}, got {verification}");

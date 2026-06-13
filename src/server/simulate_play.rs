@@ -18,7 +18,7 @@ use rosu_pp::{
   },
   Beatmap, Performance,
 };
-use rosu_v2::model::mods::GameModsLegacy;
+use rosu_mods::GameModsLegacy;
 use serde::Serialize;
 use tokio::sync::Semaphore;
 
@@ -199,7 +199,7 @@ async fn fetch_beatmaps_from_db(beatmap_ids: &[u64]) -> Result<Vec<(i64, Vec<u8>
      ({placeholders})",
   );
 
-  let mut query = sqlx::query_as::<_, (i64, Vec<u8>)>(&query_str);
+  let mut query = sqlx::query_as::<_, (i64, Vec<u8>)>(sqlx::AssertSqlSafe(query_str));
   for &id in beatmap_ids {
     query = query.bind(id as i64);
   }

@@ -275,19 +275,22 @@ async fn compute_beatmap_difficulties(
       continue;
     };
 
-    let attrs_with_mods = BeatmapAttributesBuilder::new()
+    let raw_attrs = BeatmapAttributesBuilder::new()
       .ar(beatmap_meta.diff_approach as f32, false)
       .cs(beatmap_meta.diff_size as f32, false)
       .od(beatmap_meta.diff_overall as f32, false)
       .hp(beatmap_meta.diff_drain as f32, false)
       .mods(mods.clone())
       .build();
+    // As of rosu-pp 4.0, `ar()`/`od()` are no longer clock-rate-adjusted; apply the
+    // clock rate explicitly to keep the AR/OD we return matching the pre-4.0 behavior.
+    let adjusted_attrs = raw_attrs.apply_clock_rate();
     let attrs_with_mods = BeatmapAttrs {
-      cs: attrs_with_mods.cs,
-      ar: attrs_with_mods.ar,
-      od: attrs_with_mods.od,
-      hp: attrs_with_mods.hp,
-      clock_rate: attrs_with_mods.clock_rate,
+      cs: adjusted_attrs.cs as f64,
+      ar: adjusted_attrs.ar,
+      od: adjusted_attrs.od,
+      hp: adjusted_attrs.hp as f64,
+      clock_rate: raw_attrs.clock_rate(),
     };
     attrs.push(Some(attrs_with_mods));
 
@@ -390,7 +393,7 @@ async fn get_hiscores_v2(
      version,artist,title,creator,bpm,source,difficultyrating,diff_size,diff_overall,\
      diff_approach,diff_drain,mode FROM beatmaps WHERE beatmap_id IN ({beatmap_ids_string})"
   );
-  let query = sqlx::query_as::<_, OsutrackDbBeatmap>(&query);
+  let query = sqlx::query_as::<_, OsutrackDbBeatmap>(sqlx::AssertSqlSafe(query));
   let beatmaps_meta = query
     .fetch_all(crate::db::db_pool())
     .await
@@ -645,6 +648,9 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
   #[cfg(feature = "sql")]
   crate::db::init_db_pool(&settings.sql.db_url).await?;
 
+  #[cfg(feature = "daily_challenge")]
+  embed::spawn_cache_pruner();
+
   tokio::spawn(async {
     let _ = analysis::update_analysis_data().await;
   });
@@ -658,7 +664,7 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
 
   tokio::spawn(async {
     loop {
-      let user_id: u64 = rand::Rng::random_range(&mut rand::rng(), 3..40_000_000);
+      let user_id: u64 = rand::random_range(3..40_000_000);
       let _ = admin::update_all_modes_for_user(user_id).await;
       tokio::time::sleep(Duration::from_secs(58)).await;
     }

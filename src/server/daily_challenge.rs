@@ -13,7 +13,7 @@ use crate::{
     daily_challenge::{DailyChallengeScore, NewDailyChallengeDescriptor},
     Mod,
   },
-  util::serialize_json_bytes_opt,
+  util::serialize_json_str_opt,
 };
 
 use super::{admin::validate_admin_api_token, *};
@@ -76,13 +76,13 @@ pub(crate) struct UserDailyChallengeScore {
   score_id: i64,
   pp: Option<f32>,
   rank: Option<String>,
-  #[serde(serialize_with = "serialize_json_bytes_opt")]
-  statistics: Option<Vec<u8>>,
+  #[serde(serialize_with = "serialize_json_str_opt")]
+  statistics: Option<String>,
   total_score: i64,
   started_at: Option<DateTime<Utc>>,
   ended_at: Option<DateTime<Utc>>,
-  #[serde(serialize_with = "serialize_json_bytes_opt")]
-  mods: Option<Vec<u8>>,
+  #[serde(serialize_with = "serialize_json_str_opt")]
+  mods: Option<String>,
   max_combo: i64,
   accuracy: f32,
   user_rank: i64,
@@ -145,11 +145,11 @@ async fn store_daily_challenge_scores(
           score_id: score.id,
           pp: score.pp,
           rank: Some(score.rank.clone()),
-          statistics: Some(serde_json::to_vec(&score.statistics).unwrap()),
+          statistics: Some(serde_json::to_string(&score.statistics).unwrap()),
           total_score: score.total_score as _,
           started_at: Some(score.started_at),
           ended_at: Some(score.ended_at),
-          mods: Some(serde_json::to_vec(&score.mods).unwrap()),
+          mods: Some(serde_json::to_string(&score.mods).unwrap()),
           max_combo: score.max_combo as _,
           accuracy: score.accuracy,
           user_rank: user_rank as _,
@@ -554,8 +554,8 @@ pub struct DbDailyChallengeDescriptor {
   pub day_id: i32,
   pub room_id: i64,
   pub playlist_id: i64,
-  #[serde(serialize_with = "serialize_json_bytes_opt")]
-  pub current_playlist_item: Option<Vec<u8>>,
+  #[serde(serialize_with = "serialize_json_str_opt")]
+  pub current_playlist_item: Option<String>,
 }
 
 async fn load_daily_challenge_stats() -> sqlx::Result<FxHashMap<usize, DailyChallengeStatsForDay>> {
@@ -883,7 +883,7 @@ async fn get_map_stats() -> Result<MapStats, APIError> {
     css.push(row.cs as f32);
 
     let required_mods: Vec<Mod> = match row.required_mods {
-      Some(required_mods) => serde_json::from_slice(&required_mods).unwrap_or_else(|err| {
+      Some(required_mods) => serde_json::from_str(&required_mods).unwrap_or_else(|err| {
         warn!("Failed to parse required mods for beatmap {beatmap_id}: {err}");
         Vec::new()
       }),
@@ -1728,7 +1728,7 @@ struct MinimalUserDailyChallengeScore {
   user_rank: i64,
   total_score: i64,
   ended_at: Option<DateTime<Utc>>,
-  mods: Option<Vec<u8>>,
+  mods: Option<String>,
   pp: Option<f32>,
 }
 
@@ -2134,7 +2134,7 @@ pub(crate) async fn compute_user_daily_challenge_stats(
     }
 
     match &score.mods {
-      Some(mods) => match serde_json::from_slice::<Vec<Mod>>(mods) {
+      Some(mods) => match serde_json::from_str::<Vec<Mod>>(mods) {
         Ok(mods) => {
           // sort so mod order doesn't fragment the count
           let mut combo = mods.clone();
@@ -2164,8 +2164,7 @@ pub(crate) async fn compute_user_daily_challenge_stats(
           error!(
             "Failed to parse mods for daily challenge score for user={user_id} day_id={}; found: \
              {}",
-            score.day_id,
-            String::from_utf8_lossy(mods)
+            score.day_id, mods
           );
         },
       },

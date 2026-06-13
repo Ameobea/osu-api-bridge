@@ -1062,6 +1062,61 @@ fn cache_file(user_id: u64, hash: &str, day_id: usize, ext: &str) -> PathBuf {
     .join(format!("{hash}-v{RENDER_VERSION}-{day_id}.{ext}"))
 }
 
+/// background sweep cadence and TTL. Active embeds re-render daily (and `prune_siblings` collapses
+/// them to one file per (hash, ext)); anything older than this is an embed nobody is fetching.
+const CACHE_PRUNE_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+const MAX_CACHE_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
+
+pub(crate) fn spawn_cache_pruner() {
+  tokio::spawn(async {
+    loop {
+      let _ = tokio::task::spawn_blocking(prune_embed_cache).await;
+      tokio::time::sleep(CACHE_PRUNE_INTERVAL).await;
+    }
+  });
+}
+
+/// walk `<embed_cache_dir>/embeds/<user>/` and drop files whose mtime is past `MAX_CACHE_AGE`. mtime
+/// is a clean liveness signal here because cache hits don't rewrite the file — only a fresh render
+/// bumps it. Removes per-user dirs left empty by the sweep.
+fn prune_embed_cache() {
+  let root = PathBuf::from(&SETTINGS.get().unwrap().daily_challenge.embed_cache_dir).join("embeds");
+  let now = std::time::SystemTime::now();
+  let Ok(users) = std::fs::read_dir(&root) else {
+    return;
+  };
+  let mut deleted = 0usize;
+  for user_entry in users.flatten() {
+    let user_path = user_entry.path();
+    if !user_path.is_dir() {
+      continue;
+    }
+    let Ok(files) = std::fs::read_dir(&user_path) else {
+      continue;
+    };
+    let mut remaining = 0usize;
+    for file_entry in files.flatten() {
+      let stale = file_entry
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| now.duration_since(t).ok())
+        .is_some_and(|age| age > MAX_CACHE_AGE);
+      if stale && std::fs::remove_file(file_entry.path()).is_ok() {
+        deleted += 1;
+      } else {
+        remaining += 1;
+      }
+    }
+    if remaining == 0 {
+      let _ = std::fs::remove_dir(&user_path);
+    }
+  }
+  if deleted > 0 {
+    info!("pruned {deleted} stale embed cache file(s)");
+  }
+}
+
 /// drop this hash's renders from previous days (same ext only, so .svg and .png coexist)
 fn prune_siblings(path: &std::path::Path, hash: &str, ext: &str, keep: &str) {
   let Some(dir) = path.parent() else { return };
