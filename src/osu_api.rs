@@ -884,7 +884,8 @@ pub mod daily_challenge {
     pub ranked: bool,
     pub mods: Vec<super::Mod>,
     pub statistics: super::Statistics,
-    pub total_score_without_mods: i64,
+    #[serde(default)]
+    pub total_score_without_mods: Option<i64>,
     pub beatmap_id: i64,
     pub id: i64,
     pub rank: String,
