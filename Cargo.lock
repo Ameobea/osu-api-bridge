@@ -2436,6 +2436,7 @@ dependencies = [
  "sha2 0.11.0",
  "sqlx",
  "tokio",
+ "tokio-stream",
  "tower-http",
  "tracing",
  "tracing-subscriber",
@@ -4171,6 +4172,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

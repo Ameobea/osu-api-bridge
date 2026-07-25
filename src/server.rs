@@ -684,6 +684,13 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
       )),
     )
     .route(
+      "/a/stream",
+      axum::routing::get(instrument_handler(
+        "stream_analytics_events",
+        analytics::stream_events,
+      )),
+    )
+    .route(
       "/users/{user_id}/stats",
       axum::routing::get(instrument_handler("get_user_stats", get_user_stats)),
     )

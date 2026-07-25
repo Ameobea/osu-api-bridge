@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 foundations = { version = "5.3", default-features = false, features = ["settings", "metrics", "telemetry-server", "testing", "jemalloc", "tokio-runtime-metrics", "memory-profiling", "cli"] }
 tokio = { version = "1.48", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 serde_default_utils = "0.3"
 axum = { version = "0.8", features = ["tower-log"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }

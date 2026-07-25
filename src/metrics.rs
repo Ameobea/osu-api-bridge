@@ -69,5 +69,5 @@ pub mod http_server {
   pub fn beatmap_cache_misses_total() -> Counter;
 
   /// Number of analytics events
-  pub fn analytics_events_total(category: String, subcategory: String) -> Counter;
+  pub fn analytics_events_total(project: String, category: String, subcategory: String) -> Counter;
 }
