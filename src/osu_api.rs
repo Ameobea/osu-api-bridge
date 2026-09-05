@@ -727,6 +727,46 @@ pub async fn fetch_username(user_id: u64) -> Result<Option<String>, APIError> {
   }
 }
 
+pub const MAX_BATCH_USERS: usize = 50;
+
+#[derive(Deserialize)]
+struct FetchUsersBatchRes {
+  users: Vec<User>,
+}
+
+pub async fn fetch_users_batch(user_ids: &[u64]) -> Result<Vec<User>, APIError> {
+  let endpoint_name = "fetch_users_batch";
+  let ids = user_ids
+    .iter()
+    .map(|id| format!("ids[]={id}"))
+    .collect::<Vec<_>>()
+    .join("&");
+  let proxy_url = format!("https://osu.ppy.sh/api/v2/users?{ids}");
+  let res_text = make_osu_api_request(&proxy_url, endpoint_name, Method::GET).await?;
+
+  let deserializer = &mut serde_json::Deserializer::from_str(&res_text);
+  match serde_path_to_error::deserialize::<_, FetchUsersBatchRes>(deserializer) {
+    Ok(res) => Ok(res.users),
+    Err(err) => {
+      error!("Failed to parse batch users response; res: {res_text}; err: {err}");
+      http_server::osu_api_requests_failed_total(endpoint_name, 200).inc();
+      Err(APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: "Failed to parse batch users response".to_owned(),
+      })
+    },
+  }
+}
+
+#[test]
+fn fetch_users_batch_res_parse() {
+  let res_text = r#"{"users":[{"id":4093752,"username":"ameo","avatar_url":"x","country_code":"US"},{"id":2,"username":"peppy"}]}"#;
+  let deserializer = &mut serde_json::Deserializer::from_str(res_text);
+  let res: FetchUsersBatchRes = serde_path_to_error::deserialize(deserializer).unwrap();
+  assert_eq!(res.users.len(), 2);
+  assert_eq!(res.users[1].username, "peppy");
+}
+
 #[derive(Deserialize, Debug)]
 pub struct V2Level {
   pub current: u32,

@@ -951,7 +951,7 @@ async fn get_map_stats() -> Result<MapStats, APIError> {
       }
     })?;
 
-  populate_missing_usernames(missing_user_ids.iter().copied(), all_user_ids.len()).await;
+  populate_missing_usernames(&missing_user_ids, all_user_ids.len()).await;
 
   let mut qb = QueryBuilder::new("SELECT osu_id, username FROM users WHERE osu_id IN ");
   qb.push_tuples(user_ids.iter(), |mut b, &osu_id| {
@@ -1144,11 +1144,8 @@ async fn get_existing_user_ids(
   Ok((all_user_ids, missing_user_ids, existing_user_ids))
 }
 
-async fn populate_missing_usernames(
-  missing_user_ids: impl ExactSizeIterator<Item = usize>,
-  total_user_ids: usize,
-) {
-  if missing_user_ids.len() == 0 {
+async fn populate_missing_usernames(missing_user_ids: &[usize], total_user_ids: usize) {
+  if missing_user_ids.is_empty() {
     return;
   }
 
@@ -1157,22 +1154,37 @@ async fn populate_missing_usernames(
     missing_user_ids.len(),
   );
 
-  let client = reqwest::Client::new();
-  for id in missing_user_ids {
-    // let url = format!("https://osutrack-api.ameo.dev/update?user={id}&mode=0");
-    let url = format!("https://ameobea.me/osutrack/api/get_changes.php?mode=0&id=${id}");
-    let req = client.post(&url).send().await;
-    match req {
-      Ok(res) =>
-        if res.status().is_success() {
-          info!("Successfully updated user {id}");
-        } else {
-          error!("Failed to update user {id}: {}", res.status());
-        },
-      Err(err) => error!("Failed to update user {id}: {err}"),
+  let mut populated = 0usize;
+  for chunk in missing_user_ids.chunks(crate::osu_api::MAX_BATCH_USERS) {
+    let ids: Vec<u64> = chunk.iter().map(|&id| id as u64).collect();
+    let users = match crate::osu_api::fetch_users_batch(&ids).await {
+      Ok(users) => users,
+      Err(err) => {
+        error!("Failed to fetch batch of {} users: {err:?}", ids.len());
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        continue;
+      },
+    };
+
+    if !users.is_empty() {
+      let mut qb = QueryBuilder::new("INSERT INTO users (osu_id, username) ");
+      qb.push_values(&users, |mut b, user| {
+        b.push_bind(user.id as i64).push_bind(&user.username);
+      });
+      qb.push(" ON DUPLICATE KEY UPDATE username = VALUES(username)");
+      match qb.build().execute(db_pool()).await {
+        Ok(_) => populated += users.len(),
+        Err(err) => error!("Failed to insert batch of {} usernames: {err}", users.len()),
+      }
     }
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
   }
+
+  info!(
+    "Populated {populated}/{} missing usernames",
+    missing_user_ids.len()
+  );
 }
 
 async fn build_rankings(
@@ -1191,7 +1203,7 @@ async fn build_rankings(
     })?;
 
   if fetch_missing_usernames {
-    populate_missing_usernames(missing_user_ids.iter().copied(), all_user_ids.len()).await;
+    populate_missing_usernames(&missing_user_ids, all_user_ids.len()).await;
   }
 
   let rankings_query = sqlx::query!(

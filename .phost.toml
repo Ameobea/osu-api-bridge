@@ -1,0 +1,19 @@
+[app]
+name = "osu-api-bridge"
+
+[build]
+commands = ["just docker-build"]
+image = "ameo/osu-api-bridge:latest"
+tunnels = ["3306:localhost:3306"]
+
+[deploy]
+health = { url = "http://localhost:4511/health" }
+
+[deploy.run]
+net = "host"
+env = { RUST_LOG = "info" }
+volumes = [
+  "/opt/conf/osutrack/api-bridge-conf.yml:/opt/conf.yml",
+  "/opt/osutrack-embed-cache:/embed_cache",
+]
+cmd = ["/usr/local/bin/osu-api-bridge", "--config", "/opt/conf.yml"]
