@@ -1157,13 +1157,24 @@ async fn populate_missing_usernames(missing_user_ids: &[usize], total_user_ids: 
   let mut populated = 0usize;
   for chunk in missing_user_ids.chunks(crate::osu_api::MAX_BATCH_USERS) {
     let ids: Vec<u64> = chunk.iter().map(|&id| id as u64).collect();
-    let users = match crate::osu_api::fetch_users_batch(&ids).await {
-      Ok(users) => users,
-      Err(err) => {
-        error!("Failed to fetch batch of {} users: {err:?}", ids.len());
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        continue;
-      },
+    let mut fetched = None;
+    for attempt in 1..=3 {
+      match crate::osu_api::fetch_users_batch(&ids).await {
+        Ok(users) => {
+          fetched = Some(users);
+          break;
+        },
+        Err(err) => {
+          error!(
+            "Failed to fetch batch of {} users (attempt {attempt}): {err:?}",
+            ids.len()
+          );
+          tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        },
+      }
+    }
+    let Some(users) = fetched else {
+      continue;
     };
 
     if !users.is_empty() {
@@ -1178,7 +1189,8 @@ async fn populate_missing_usernames(missing_user_ids: &[usize], total_user_ids: 
       }
     }
 
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // Each id costs one unit of osu!'s 1200/min quota, so 50 ids per 5s stays under half of it.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
   }
 
   info!(

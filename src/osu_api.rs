@@ -412,7 +412,7 @@ async fn make_osu_api_request_inner(
   http_server::osu_api_response_time_seconds(endpoint_name).observe(elapsed.as_nanos() as u64);
 
   let status_code = res.status();
-  res.text().await.map_err(|err| {
+  let res_text = res.text().await.map_err(|err| {
     error!(
       ?status_code,
       ?endpoint_name,
@@ -423,7 +423,29 @@ async fn make_osu_api_request_inner(
       status: StatusCode::INTERNAL_SERVER_ERROR,
       message: "Failed to response from osu! API".to_owned(),
     }
-  })
+  })?;
+
+  // 429/5xx bodies like `{"error":"Too Many Attempts."}` would otherwise deserialize as the
+  // `{"error":null}` not-found shape and get treated as a deleted user.
+  if status_code == StatusCode::TOO_MANY_REQUESTS || status_code.is_server_error() {
+    error!(
+      ?status_code,
+      ?endpoint_name,
+      "osu! API request failed: {}",
+      res_text.chars().take(200).collect::<String>()
+    );
+    http_server::osu_api_requests_failed_total(endpoint_name, status_code.as_u16()).inc();
+    return Err(APIError {
+      status: if status_code == StatusCode::TOO_MANY_REQUESTS {
+        StatusCode::TOO_MANY_REQUESTS
+      } else {
+        StatusCode::BAD_GATEWAY
+      },
+      message: format!("osu! API request failed with status {status_code}"),
+    });
+  }
+
+  Ok(res_text)
 }
 
 async fn make_osu_api_request(
