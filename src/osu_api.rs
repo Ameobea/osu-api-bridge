@@ -183,6 +183,11 @@ pub struct Statistics {
   pub good: Option<i64>,
   pub large_bonus: Option<i64>,
   pub small_bonus: Option<i64>,
+  pub large_tick_hit: Option<i64>,
+  pub large_tick_miss: Option<i64>,
+  pub small_tick_hit: Option<i64>,
+  pub small_tick_miss: Option<i64>,
+  pub slider_tail_hit: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -266,6 +271,7 @@ pub struct BeatmapDifficulties {
   pub difficulty_aim: f64,
   pub difficulty_speed: f64,
   pub difficulty_flashlight: f64,
+  pub difficulty_reading: f64,
   pub speed_note_count: f64,
   pub slider_factor: f64,
   pub stars: f64,

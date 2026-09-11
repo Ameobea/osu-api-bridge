@@ -1,1 +1,6 @@
 target
+.git
+diffcalc/bin
+diffcalc/obj
+diffcalc/.env
+diffcalc/appsettings.Local.json

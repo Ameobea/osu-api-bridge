@@ -1,0 +1,14 @@
+[app]
+name = "osu-diffcalc"
+
+[build]
+commands = ["docker build -t osu-diffcalc:latest ."]
+image = "osu-diffcalc:latest"
+
+[deploy]
+health = { url = "http://127.0.0.1:4512/health/ready" }
+
+[deploy.run]
+net = "host"
+env = { DiffCalc__ApiPort = "4512", DiffCalc__MetricsPort = "4513" }
+env_file = ".env"

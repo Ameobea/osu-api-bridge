@@ -1,4 +1,4 @@
-use foundations::telemetry::metrics::{metrics, Counter, Gauge, HistogramBuilder, TimeHistogram};
+use foundations::telemetry::metrics::{metrics, Counter, HistogramBuilder, TimeHistogram};
 
 #[metrics]
 pub mod http_server {
@@ -10,6 +10,15 @@ pub mod http_server {
 
   /// Number of failed requests
   pub fn requests_failed_total(endpoint_name: &'static str) -> Counter;
+
+  /// End-to-end duration of instrumented HTTP handlers.
+  #[ctor = HistogramBuilder {
+    buckets: &[
+      0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.25, 0.4, 0.6, 0.8, 1.0, 1.25,
+      1.5, 1.75, 2.0, 2.5, 5.0, 10.0, 20.0,
+    ],
+  }]
+  pub fn request_duration_seconds(endpoint_name: &'static str) -> TimeHistogram;
 
   /// Number of requests made to the osu! API
   pub fn osu_api_requests_total(endpoint_name: &'static str) -> Counter;
@@ -35,38 +44,26 @@ pub mod http_server {
   }]
   pub fn oauth_refresh_response_time_seconds() -> TimeHistogram;
 
-  /// Distribution of response times for downloading beatmaps
-  #[ctor = HistogramBuilder {
-    buckets: &[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
-  }]
-  pub fn beatmap_download_response_time_seconds() -> TimeHistogram;
-
-  /// Distribution of beatmap parse times
-  #[ctor = HistogramBuilder {
-    buckets: &[0.00001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25],
-  }]
-  pub fn beatmap_parse_time_seconds() -> TimeHistogram;
-
-  /// Distribution of beatmap batch DB fetch times
-  #[ctor = HistogramBuilder {
-    buckets: &[0.00001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25],
-  }]
-  pub fn beatmap_batch_db_fetch_time_seconds() -> TimeHistogram;
-
   /// Distribution of compute beatmap difficulties durations
   #[ctor = HistogramBuilder {
     buckets: &[0.00001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25],
   }]
   pub fn compute_beatmap_difficulties_duration() -> TimeHistogram;
 
-  /// Number of bytes currently cached in the beatmap cache
-  pub fn beatmap_cache_bytes() -> Gauge;
+  /// Number of requests made to the private canonical diffcalc sidecar.
+  pub fn diffcalc_requests_total(operation: &'static str, status: &'static str) -> Counter;
 
-  /// Number of beatmap cache hits
-  pub fn beatmap_cache_hits_total() -> Counter;
+  /// Distribution of response times from the private diffcalc sidecar.
+  #[ctor = HistogramBuilder {
+    buckets: &[
+      0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.25, 0.4, 0.6, 0.8, 1.0, 1.25,
+      1.5, 1.75, 2.0, 2.5, 5.0, 10.0, 20.0,
+    ],
+  }]
+  pub fn diffcalc_response_time_seconds(operation: &'static str) -> TimeHistogram;
 
-  /// Number of beatmap cache misses
-  pub fn beatmap_cache_misses_total() -> Counter;
+  /// Number of public simulation requests rejected by the edge guard.
+  pub fn simulation_rejections_total(reason: &'static str) -> Counter;
 
   /// Number of analytics events
   pub fn analytics_events_total(project: String, category: String, subcategory: String) -> Counter;

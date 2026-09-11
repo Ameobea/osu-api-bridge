@@ -4,28 +4,20 @@ use std::{
   pin::Pin,
   sync::Arc,
   task::{Context, Poll},
-  time::Duration,
+  time::{Duration, Instant},
 };
 
 use arc_swap::ArcSwap;
 use axum::{
-  extract::{Path, Query, Request},
+  extract::{DefaultBodyLimit, Path, Query, Request},
   handler::Handler,
   http::StatusCode,
   response::{IntoResponse, Response},
   Json, Router,
 };
-use dashmap::DashMap;
 use float_ord::FloatOrd;
 use foundations::BootstrapResult;
 use fxhash::FxHashMap;
-use rosu_mods::{GameMod, GameMods};
-use rosu_pp::{
-  any::{DifficultyAttributes, PerformanceAttributes},
-  model::beatmap::BeatmapAttributesBuilder,
-  osu::OsuDifficultyAttributes,
-  Beatmap, Difficulty, Performance,
-};
 use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
 use tower_http::{
@@ -140,31 +132,27 @@ pub struct OsuPerformanceAttributes {
   pub pp_flashlight: f64,
   /// The speed portion of the final pp.
   pub pp_speed: f64,
+  /// The reading portion of the final pp.
+  pub pp_reading: f64,
   /// Misses including an approximated amount of slider breaks
   pub effective_miss_count: f64,
   /// Approximated unstable-rate
   pub speed_deviation: Option<f64>,
 }
 
-impl From<rosu_pp::osu::OsuPerformanceAttributes> for OsuPerformanceAttributes {
-  fn from(attr: rosu_pp::osu::OsuPerformanceAttributes) -> Self {
+impl From<&crate::diffcalc::PerformanceResult> for OsuPerformanceAttributes {
+  fn from(attr: &crate::diffcalc::PerformanceResult) -> Self {
     OsuPerformanceAttributes {
       pp: attr.pp,
-      pp_acc: attr.pp_acc,
-      pp_aim: attr.pp_aim,
-      pp_flashlight: attr.pp_flashlight,
-      pp_speed: attr.pp_speed,
+      pp_acc: attr.accuracy,
+      pp_aim: attr.aim,
+      pp_flashlight: attr.flashlight,
+      pp_speed: attr.speed,
+      pp_reading: attr.reading,
       effective_miss_count: attr.effective_miss_count,
       speed_deviation: attr.speed_deviation,
     }
   }
-}
-
-#[derive(Hash, PartialEq, Eq, Clone)]
-struct DifficultyPerfCacheKey {
-  beatmap_id: u64,
-  mods_string: String,
-  is_classic: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -176,19 +164,8 @@ pub struct BeatmapAttrs {
   pub clock_rate: f64,
 }
 
-lazy_static::lazy_static! {
-  static ref DIFFICULTY_PERF_CACHE: DashMap<DifficultyPerfCacheKey, OsuDifficultyAttributes> = DashMap::new();
-}
-
-fn mods_to_string(mods: &GameMods) -> String {
-  let mut mod_strings: Vec<String> = mods.iter().map(|m| m.acronym().to_string()).collect();
-  mod_strings.sort();
-  mod_strings.join("")
-}
-
 async fn compute_beatmap_difficulties(
   hiscores: &[HiscoreV2],
-  beatmap_metadata: &FxHashMap<u64, OsutrackDbBeatmap>,
 ) -> Result<
   (
     Vec<Option<BeatmapDifficulties>>,
@@ -198,175 +175,133 @@ async fn compute_beatmap_difficulties(
   APIError,
 > {
   let _timer = http_server::compute_beatmap_difficulties_duration().start_timer();
+  fn count(value: Option<i64>, name: &str) -> Result<Option<u32>, APIError> {
+    value
+      .map(|value| {
+        u32::try_from(value).map_err(|_| APIError {
+          status: StatusCode::BAD_GATEWAY,
+          message: format!("osu! returned an invalid {name} count"),
+        })
+      })
+      .transpose()
+  }
 
-  let beatmap_ids: Vec<u64> = hiscores
-    .iter()
-    .map(|hiscore| hiscore.beatmap_id as u64)
-    .collect();
+  let mut requests = Vec::with_capacity(hiscores.len() * 2);
+  for (index, hiscore) in hiscores.iter().enumerate() {
+    let beatmap_id = i32::try_from(hiscore.beatmap_id).map_err(|_| APIError {
+      status: StatusCode::BAD_GATEWAY,
+      message: "osu! returned an invalid beatmap ID".to_owned(),
+    })?;
+    let is_classic = hiscore.mods.iter().any(|m| m.acronym == "CL");
+    let has_main_statistics = hiscore.statistics.great.is_some()
+      || hiscore.statistics.ok.is_some()
+      || hiscore.statistics.meh.is_some();
+    let statistics = crate::diffcalc::ScoreStatisticsInput {
+      great: if has_main_statistics {
+        Some(count(hiscore.statistics.great, "great")?.unwrap_or(0))
+      } else {
+        None
+      },
+      ok: if has_main_statistics {
+        Some(count(hiscore.statistics.ok, "ok")?.unwrap_or(0))
+      } else {
+        None
+      },
+      meh: if has_main_statistics {
+        Some(count(hiscore.statistics.meh, "meh")?.unwrap_or(0))
+      } else {
+        None
+      },
+      miss: count(hiscore.statistics.miss, "miss")?.unwrap_or(0),
+      large_tick_hit: count(hiscore.statistics.large_tick_hit, "large_tick_hit")?,
+      large_tick_miss: count(hiscore.statistics.large_tick_miss, "large_tick_miss")?,
+      small_tick_hit: count(hiscore.statistics.small_tick_hit, "small_tick_hit")?,
+      small_tick_miss: count(hiscore.statistics.small_tick_miss, "small_tick_miss")?,
+      slider_tail_hit: count(hiscore.statistics.slider_tail_hit, "slider_tail_hit")?,
+      large_bonus: count(hiscore.statistics.large_bonus, "large_bonus")?,
+      small_bonus: count(hiscore.statistics.small_bonus, "small_bonus")?,
+    };
+    let max_combo = u32::try_from(hiscore.max_combo).map_err(|_| APIError {
+      status: StatusCode::BAD_GATEWAY,
+      message: "osu! returned an invalid max combo".to_owned(),
+    })?;
 
-  let beatmaps: Vec<Option<Arc<Beatmap>>> =
-    simulate_play::fetch_beatmaps_cached_only(&beatmap_ids).await;
+    requests.push(crate::diffcalc::CalculationRequest {
+      request_id: Some(format!("{index}:earned")),
+      beatmap_id,
+      mods: hiscore.mods.clone(),
+      is_classic,
+      score: Some(crate::diffcalc::ScoreInput {
+        accuracy: hiscore.accuracy * 100.0,
+        max_combo: Some(max_combo),
+        legacy_total_score: hiscore.legacy_total_score,
+        statistics: Some(statistics),
+      }),
+    });
+    requests.push(crate::diffcalc::CalculationRequest {
+      request_id: Some(format!("{index}:max")),
+      beatmap_id,
+      mods: hiscore.mods.clone(),
+      is_classic,
+      score: Some(crate::diffcalc::ScoreInput {
+        accuracy: 100.0,
+        max_combo: None,
+        legacy_total_score: None,
+        statistics: None,
+      }),
+    });
+  }
 
-  let missing_ids: Vec<u64> = beatmap_ids
-    .iter()
-    .zip(&beatmaps)
-    .filter_map(|(&id, beatmap)| if beatmap.is_none() { Some(id) } else { None })
-    .collect();
-
-  if !missing_ids.is_empty() {
-    tokio::spawn(async move {
-      for beatmap_id in missing_ids {
-        if let Err(err) = simulate_play::fetch_and_store_beatmap(beatmap_id).await {
-          warn!(
-            "Failed to fetch beatmap {beatmap_id} in background: {}",
-            err.message
-          );
-        }
-      }
+  let results =
+    crate::diffcalc::calculate_all(crate::diffcalc::Operation::Hiscores, requests).await?;
+  if results.len() != hiscores.len() * 2 {
+    return Err(APIError {
+      status: StatusCode::BAD_GATEWAY,
+      message: "Difficulty calculation service returned the wrong result count".to_owned(),
     });
   }
 
   let mut diffs = Vec::with_capacity(hiscores.len());
   let mut attrs = Vec::with_capacity(hiscores.len());
   let mut perfs = Vec::with_capacity(hiscores.len());
-
-  for (beatmap_opt, hiscore) in beatmaps.iter().zip(hiscores.iter()) {
-    let mut mods = GameMods::default();
-    let mut is_classic = false;
-    for m in &hiscore.mods {
-      match m.acronym.as_str() {
-        "NF" => mods.insert(GameMod::NoFailOsu(Default::default())),
-        "EZ" => mods.insert(GameMod::EasyOsu(Default::default())),
-        "TD" => mods.insert(GameMod::TouchDeviceOsu(Default::default())),
-        "HD" => mods.insert(GameMod::HiddenOsu(Default::default())),
-        "HR" => mods.insert(GameMod::HardRockOsu(Default::default())),
-        "SD" => mods.insert(GameMod::SuddenDeathOsu(Default::default())),
-        "PF" => mods.insert(GameMod::PerfectOsu(Default::default())),
-        "DT" => mods.insert(GameMod::DoubleTimeOsu(Default::default())),
-        "RX" => mods.insert(GameMod::RelaxOsu(Default::default())),
-        "HT" => mods.insert(GameMod::HalfTimeOsu(Default::default())),
-        "NC" => {
-          mods.insert(GameMod::DoubleTimeOsu(Default::default()));
-          mods.insert(GameMod::NightcoreOsu(Default::default()))
-        },
-        "FL" => mods.insert(GameMod::FlashlightOsu(Default::default())),
-        "SO" => mods.insert(GameMod::SpunOutOsu(Default::default())),
-        "TC" => mods.insert(GameMod::TraceableOsu(Default::default())),
-        "BL" => mods.insert(GameMod::BlindsOsu(Default::default())),
-        "NS" => mods.insert(GameMod::NoScopeOsu(Default::default())),
-        "MU" => mods.insert(GameMod::MutedOsu(Default::default())),
-        "AP" => mods.insert(GameMod::AutopilotOsu(Default::default())),
-        "2K" => mods.insert(GameMod::TwoKeysMania(Default::default())),
-        "3K" => mods.insert(GameMod::ThreeKeysMania(Default::default())),
-        "4K" => mods.insert(GameMod::FourKeysMania(Default::default())),
-        "5K" => mods.insert(GameMod::FiveKeysMania(Default::default())),
-        "6K" => mods.insert(GameMod::SixKeysMania(Default::default())),
-        "7K" => mods.insert(GameMod::SevenKeysMania(Default::default())),
-        "CL" => is_classic = true,
-        _ => warn!("Unhandled mod acronym in ranked score: {}", m.acronym),
-      }
+  for (hiscore, pair) in hiscores.iter().zip(results.chunks_exact(2)) {
+    let earned = &pair[0];
+    let max = &pair[1];
+    if let Some(error) = earned.error.as_ref().or(max.error.as_ref()) {
+      warn!(
+        "diffcalc failed for beatmap {}: {}: {}",
+        hiscore.beatmap_id, error.code, error.message
+      );
     }
 
-    let Some(beatmap_meta) = beatmap_metadata.get(&(hiscore.beatmap_id as u64)) else {
-      warn!("Missing beatmap metadata for {}", hiscore.beatmap_id);
-      diffs.push(None);
-      attrs.push(None);
-      perfs.push(None);
-      continue;
-    };
-
-    let raw_attrs = BeatmapAttributesBuilder::new()
-      .ar(beatmap_meta.diff_approach as f32, false)
-      .cs(beatmap_meta.diff_size as f32, false)
-      .od(beatmap_meta.diff_overall as f32, false)
-      .hp(beatmap_meta.diff_drain as f32, false)
-      .mods(mods.clone())
-      .build();
-    // As of rosu-pp 4.0, `ar()`/`od()` are no longer clock-rate-adjusted; apply the
-    // clock rate explicitly to keep the AR/OD we return matching the pre-4.0 behavior.
-    let adjusted_attrs = raw_attrs.apply_clock_rate();
-    let attrs_with_mods = BeatmapAttrs {
-      cs: adjusted_attrs.cs as f64,
-      ar: adjusted_attrs.ar,
-      od: adjusted_attrs.od,
-      hp: adjusted_attrs.hp as f64,
-      clock_rate: raw_attrs.clock_rate(),
-    };
-    attrs.push(Some(attrs_with_mods));
-
-    let cache_key = DifficultyPerfCacheKey {
-      beatmap_id: hiscore.beatmap_id as u64,
-      mods_string: mods_to_string(&mods),
-      is_classic,
-    };
-    let diff = match DIFFICULTY_PERF_CACHE.get(&cache_key) {
-      Some(cached) => cached.clone(),
-      None => {
-        let diff = Difficulty::new().mods(mods.clone()).lazer(!is_classic);
-
-        let Some(beatmap) = beatmap_opt else {
-          diffs.push(None);
-          perfs.push(None);
-          continue;
-        };
-
-        let diff = diff.calculate(&beatmap);
-        let DifficultyAttributes::Osu(diff) = diff else {
-          diffs.push(None);
-          perfs.push(None);
-          continue;
-        };
-
-        DIFFICULTY_PERF_CACHE.insert(cache_key, diff.clone());
-        diff
-      },
-    };
-
-    diffs.push(Some(BeatmapDifficulties {
+    let difficulty = earned.difficulty.as_ref().or(max.difficulty.as_ref());
+    diffs.push(difficulty.map(|diff| BeatmapDifficulties {
       score_id: hiscore.build_score_id(),
       difficulty_aim: diff.aim,
       difficulty_speed: diff.speed,
       difficulty_flashlight: diff.flashlight,
+      difficulty_reading: diff.reading,
       speed_note_count: diff.speed_note_count,
       slider_factor: diff.slider_factor,
       stars: diff.stars,
     }));
+    attrs.push(difficulty.map(|diff| BeatmapAttrs {
+      cs: diff.circle_size,
+      ar: diff.approach_rate,
+      od: diff.overall_difficulty,
+      hp: diff.drain_rate,
+      clock_rate: diff.clock_rate,
+    }));
 
-    let perf = Performance::new(diff.clone())
-      .mods(mods.clone())
-      .lazer(!is_classic)
-      .combo(hiscore.max_combo as _)
-      .misses(hiscore.statistics.miss.unwrap_or(0) as _)
-      .n300(hiscore.statistics.great.unwrap_or(0) as _)
-      .n100(hiscore.statistics.ok.unwrap_or(0) as _)
-      .n50(hiscore.statistics.meh.unwrap_or(0) as _);
-
-    let perf = perf.calculate();
-    let PerformanceAttributes::Osu(perf) = perf else {
-      perfs.push(None);
-      continue;
-    };
-
-    let earned_attrs = OsuPerformanceAttributes::from(perf);
-
-    let perf = Performance::new(diff.clone())
-      .mods(mods)
-      .lazer(!is_classic)
-      .accuracy(100.);
-    let perf = perf.calculate();
-    let PerformanceAttributes::Osu(perf) = perf else {
-      perfs.push(None);
-      continue;
-    };
-
-    let max_attrs = OsuPerformanceAttributes::from(perf);
-
-    let perf_attrs = PerfAttrs {
-      earned: earned_attrs,
-      max: max_attrs,
-    };
-
-    perfs.push(Some(perf_attrs.clone()));
+    let perf = earned
+      .performance
+      .as_ref()
+      .zip(max.performance.as_ref())
+      .map(|(earned, max)| PerfAttrs {
+        earned: OsuPerformanceAttributes::from(earned),
+        max: OsuPerformanceAttributes::from(max),
+      });
+    perfs.push(perf);
   }
 
   Ok((diffs, attrs, perfs))
@@ -382,32 +317,33 @@ async fn get_hiscores_v2(
     .iter()
     .map(|hs| hs.beatmap_id)
     .collect::<Vec<i64>>();
-  let beatmap_ids_string = beatmap_ids
-    .iter()
-    .map(|id| id.to_string())
-    .collect::<Vec<_>>()
-    .join(",");
-
-  let query = format!(
-    "SELECT beatmapset_id,beatmap_id,approved,approved_date,last_update,total_length,hit_length,\
-     version,artist,title,creator,bpm,source,difficultyrating,diff_size,diff_overall,\
-     diff_approach,diff_drain,mode FROM beatmaps WHERE beatmap_id IN ({beatmap_ids_string})"
-  );
-  let query = sqlx::query_as::<_, OsutrackDbBeatmap>(sqlx::AssertSqlSafe(query));
-  let beatmaps_meta = query
-    .fetch_all(crate::db::db_pool())
-    .await
-    .map_err(|err| APIError {
-      status: StatusCode::INTERNAL_SERVER_ERROR,
-      message: format!("Error fetching beatmaps from DB: {err}"),
-    })?;
-  let beatmaps_meta = beatmaps_meta
-    .into_iter()
-    .map(|bm| (bm.beatmap_id as u64, bm))
-    .collect::<FxHashMap<u64, OsutrackDbBeatmap>>();
+  let beatmaps_meta = if beatmap_ids.is_empty() {
+    FxHashMap::default()
+  } else {
+    let beatmap_ids_string = beatmap_ids
+      .iter()
+      .map(|id| id.to_string())
+      .collect::<Vec<_>>()
+      .join(",");
+    let query = format!(
+      "SELECT beatmapset_id,beatmap_id,approved,approved_date,last_update,total_length,hit_length,\
+       version,artist,title,creator,bpm,source,difficultyrating,diff_size,diff_overall,\
+       diff_approach,diff_drain,mode FROM beatmaps WHERE beatmap_id IN ({beatmap_ids_string})"
+    );
+    sqlx::query_as::<_, OsutrackDbBeatmap>(sqlx::AssertSqlSafe(query))
+      .fetch_all(crate::db::db_pool())
+      .await
+      .map_err(|err| APIError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("Error fetching beatmaps from DB: {err}"),
+      })?
+      .into_iter()
+      .map(|bm| (bm.beatmap_id as u64, bm))
+      .collect()
+  };
 
   let computed_diffs = if params.mode == Ruleset::Osu {
-    Some(compute_beatmap_difficulties(&hiscores_v2, &beatmaps_meta).await?)
+    Some(compute_beatmap_difficulties(&hiscores_v2).await?)
   } else {
     None
   };
@@ -502,6 +438,12 @@ async fn get_user_best_score_for_beatmap(
       return true;
     }
 
+    let mod_a_is_ht = mod_a == "HT" || mod_a == "DC";
+    let mod_b_is_ht = mod_b == "HT" || mod_b == "DC";
+    if mod_a_is_ht && mod_b_is_ht {
+      return true;
+    }
+
     false
   }
 
@@ -582,14 +524,13 @@ struct InstrumentedHandlerFuture<F> {
   #[pin]
   inner: F,
   endpoint_name: &'static str,
+  started: Instant,
 }
 
 impl<F: Unpin + Future<Output = Response>> Future for InstrumentedHandlerFuture<F> {
   type Output = Response;
 
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-    http_server::requests_total(self.endpoint_name).inc();
-
     let endpoint_name = self.endpoint_name;
     let this = self.project();
     let inner = this.inner;
@@ -597,6 +538,8 @@ impl<F: Unpin + Future<Output = Response>> Future for InstrumentedHandlerFuture<
 
     match inner_poll {
       Poll::Ready(res) => {
+        http_server::request_duration_seconds(endpoint_name)
+          .observe(this.started.elapsed().as_nanos() as u64);
         if res.status().is_success() {
           http_server::requests_success_total(endpoint_name).inc();
         } else {
@@ -617,10 +560,12 @@ where
   type Future = InstrumentedHandlerFuture<H::Future>;
 
   fn call(self, req: Request, state: S) -> Self::Future {
+    http_server::requests_total(self.endpoint_name).inc();
     let res_future = self.handler.call(req, state);
     InstrumentedHandlerFuture {
       inner: res_future,
       endpoint_name: self.endpoint_name,
+      started: Instant::now(),
     }
   }
 }
@@ -640,6 +585,9 @@ static SETTINGS: OnceCell<ServerSettings> = OnceCell::const_new();
 
 pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
   set_client_info(settings.osu_client_id, settings.osu_client_secret.clone());
+
+  #[cfg(feature = "simulate_play")]
+  crate::diffcalc::init(&settings.diffcalc);
 
   SETTINGS
     .set(settings.clone())
@@ -740,7 +688,8 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
         axum::routing::post(instrument_handler(
           "batch_simulate_play",
           simulate_play::batch_simulate_play_route,
-        )),
+        ))
+        .layer(DefaultBodyLimit::max(64 * 1024)),
       );
   }
 

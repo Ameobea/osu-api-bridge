@@ -1,400 +1,21 @@
-use std::{
-  io::{Read, Write},
-  str::FromStr,
-  sync::{
-    atomic::{AtomicI64, Ordering},
-    Arc, Mutex as SyncMutex,
-  },
-  time::Duration,
-};
+use std::collections::HashSet;
 
-use moka::sync::Cache;
-use rosu_pp::{
-  any::DifficultyAttributes,
-  model::{
-    beatmap::BreakPeriod,
-    control_point::{DifficultyPoint, EffectPoint, TimingPoint},
-    hit_object::{HitObject, HitSoundType},
-  },
-  Beatmap, Performance,
-};
-use rosu_mods::GameModsLegacy;
 use serde::Serialize;
 use tokio::sync::Semaphore;
 
 use super::*;
-use crate::db::db_pool;
+use crate::{
+  diffcalc::{self, CalculationRequest, ScoreInput, ScoreStatisticsInput},
+  osu_api::Mod,
+};
 
-async fn compress_and_insert_beatmap(beatmap_id: i32, raw_beatmap: &[u8]) -> Result<(), APIError> {
-  let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-
-  encoder
-    .write_all(raw_beatmap)
-    .expect("Failed to write to encoder");
-  let raw_beatmap_gzipped = encoder.finish().expect("Failed to finish encoder");
-
-  sqlx::query!(
-    "INSERT INTO fetched_beatmaps (beatmap_id, raw_beatmap_gzipped) VALUES (?, ?)",
-    beatmap_id,
-    raw_beatmap_gzipped
-  )
-  .execute(crate::db::db_pool())
-  .await
-  .map_err(|err| {
-    error!("Failed to insert beatmap {beatmap_id}: {err}");
-    APIError {
-      status: StatusCode::INTERNAL_SERVER_ERROR,
-      message: format!("Failed to insert beatmap {beatmap_id}"),
-    }
-  })?;
-
-  Ok(())
-}
-
-async fn download_beatmap(beatmap_id: i32) -> Result<Vec<u8>, APIError> {
-  const MAX_RETRIES: u32 = 5;
-  const BACKOFF_MS: u64 = 1000;
-
-  let _permit = DOWNLOAD_SEMAPHORE.acquire().await.unwrap();
-
-  for attempt in 0..MAX_RETRIES {
-    let url = format!("https://osu.ppy.sh/osu/{beatmap_id}");
-    info!("Downloading beatmap {beatmap_id} from osu...");
-
-    let _timer =
-      crate::metrics::http_server::beatmap_download_response_time_seconds().start_timer();
-
-    let resp = reqwest::get(&url).await.map_err(|err| {
-      error!(
-        "Error fetching beatmap {beatmap_id} (attempt {}): {err}",
-        attempt + 1
-      );
-      APIError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: format!("Error fetching beatmap {beatmap_id}"),
-      }
-    })?;
-
-    if resp.status().is_success() {
-      info!("Successfully downloaded beatmap {beatmap_id}");
-      let raw_beatmap = resp.bytes().await.unwrap();
-      return Ok(raw_beatmap.to_vec());
-    } else if attempt < MAX_RETRIES - 1 {
-      let status = resp.status();
-      warn!(
-        "Failed to fetch beatmap {beatmap_id} (attempt {}): {status}, retrying...",
-        attempt + 1
-      );
-      tokio::time::sleep(Duration::from_millis(BACKOFF_MS * (attempt as u64 + 1))).await;
-    } else {
-      let status = resp.status();
-      let body = resp
-        .text()
-        .await
-        .unwrap_or_else(|_| "Failed to fetch body".to_owned());
-      error!("Failed to fetch beatmap {beatmap_id} after {MAX_RETRIES} attempts: {status} {body}");
-      return Err(APIError {
-        status: StatusCode::NOT_FOUND,
-        message: format!("Failed to fetch beatmap {beatmap_id}"),
-      });
-    }
-  }
-
-  unreachable!()
-}
-
-async fn download_and_store_beatmap(beatmap_id: u64) -> Result<Beatmap, APIError> {
-  let raw_beatmap = download_beatmap(beatmap_id as _).await?;
-  compress_and_insert_beatmap(beatmap_id as _, &raw_beatmap).await?;
-
-  Beatmap::from_bytes(&raw_beatmap).map_err(|err| APIError {
-    status: StatusCode::INTERNAL_SERVER_ERROR,
-    message: format!("Error parsing beatmap: {err}"),
-  })
-}
+const MAX_PUBLIC_BATCH_SIZE: usize = 128;
+const MAX_PUBLIC_COUNT: u32 = 10_000_000;
 
 lazy_static::lazy_static! {
-  static ref BEATMAP_CACHE_BYTES: AtomicI64 = AtomicI64::new(0);
-  static ref BEATMAP_CACHE: Cache<u64, Arc<Beatmap>> = Cache::builder()
-    .max_capacity(40_000)
-    .eviction_listener(|_key: Arc<u64>, val: Arc<Beatmap>, _cause| {
-      let bytes = estimate_beatmap_size(&val);
-      let new_total = BEATMAP_CACHE_BYTES.fetch_sub(bytes, Ordering::Relaxed) - bytes;
-      crate::metrics::http_server::beatmap_cache_bytes().set(new_total as u64);
-    })
-    .build();
-  static ref DOWNLOAD_SEMAPHORE: Semaphore = Semaphore::new(1);
-}
-
-fn estimate_beatmap_size(beatmap: &Beatmap) -> i64 {
-  let base_size = std::mem::size_of::<Beatmap>() as i64;
-
-  let breaks_size = (beatmap.breaks.capacity() * std::mem::size_of::<BreakPeriod>()) as i64;
-  let timing_points_size =
-    (beatmap.timing_points.capacity() * std::mem::size_of::<TimingPoint>()) as i64;
-  let difficulty_points_size =
-    (beatmap.difficulty_points.capacity() * std::mem::size_of::<DifficultyPoint>()) as i64;
-  let effect_points_size =
-    (beatmap.effect_points.capacity() * std::mem::size_of::<EffectPoint>()) as i64;
-  let hit_objects_size = (beatmap.hit_objects.capacity() * std::mem::size_of::<HitObject>()) as i64;
-  let hit_sounds_size =
-    (beatmap.hit_sounds.capacity() * std::mem::size_of::<HitSoundType>()) as i64;
-
-  base_size
-    + breaks_size
-    + timing_points_size
-    + difficulty_points_size
-    + effect_points_size
-    + hit_objects_size
-    + hit_sounds_size
-}
-
-fn insert_beatmap_into_cache(beatmap_id: u64, mut beatmap: Beatmap) -> Arc<Beatmap> {
-  beatmap.breaks.shrink_to_fit();
-  beatmap.timing_points.shrink_to_fit();
-  beatmap.difficulty_points.shrink_to_fit();
-  beatmap.effect_points.shrink_to_fit();
-  beatmap.hit_objects.shrink_to_fit();
-  beatmap.hit_sounds.shrink_to_fit();
-
-  let beatmap = Arc::new(beatmap);
-  let bytes = estimate_beatmap_size(&beatmap);
-  BEATMAP_CACHE.insert(beatmap_id, Arc::clone(&beatmap));
-  let new_total = BEATMAP_CACHE_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
-  crate::metrics::http_server::beatmap_cache_bytes().set(new_total as u64);
-  beatmap
-}
-
-fn decompress_and_parse_beatmap(
-  beatmap_id: u64,
-  raw_beatmap_gzipped: &[u8],
-) -> Result<Arc<Beatmap>, APIError> {
-  let _timer = crate::metrics::http_server::beatmap_parse_time_seconds().start_timer();
-  let mut decoder = flate2::read::GzDecoder::new(raw_beatmap_gzipped);
-  let mut decompressed = Vec::new();
-  decoder
-    .read_to_end(&mut decompressed)
-    .map_err(|err| APIError {
-      status: StatusCode::INTERNAL_SERVER_ERROR,
-      message: format!("Error decompressing beatmap {beatmap_id}: {err}"),
-    })?;
-
-  let beatmap = Beatmap::from_bytes(&decompressed).map_err(|err| APIError {
-    status: StatusCode::INTERNAL_SERVER_ERROR,
-    message: format!("Error parsing beatmap {beatmap_id}: {err}"),
-  })?;
-
-  Ok(insert_beatmap_into_cache(beatmap_id, beatmap))
-}
-
-async fn fetch_beatmaps_from_db(beatmap_ids: &[u64]) -> Result<Vec<(i64, Vec<u8>)>, APIError> {
-  let _timer = crate::metrics::http_server::beatmap_batch_db_fetch_time_seconds().start_timer();
-  let placeholders = beatmap_ids
-    .iter()
-    .map(|_| "?")
-    .collect::<Vec<_>>()
-    .join(",");
-  let query_str = format!(
-    "SELECT beatmap_id, raw_beatmap_gzipped FROM fetched_beatmaps WHERE beatmap_id IN \
-     ({placeholders})",
-  );
-
-  let mut query = sqlx::query_as::<_, (i64, Vec<u8>)>(sqlx::AssertSqlSafe(query_str));
-  for &id in beatmap_ids {
-    query = query.bind(id as i64);
-  }
-
-  query.fetch_all(db_pool()).await.map_err(|err| {
-    error!("Error fetching beatmaps from DB: {err}");
-    APIError {
-      status: StatusCode::INTERNAL_SERVER_ERROR,
-      message: format!("Error fetching beatmaps from DB: {err}"),
-    }
-  })
-}
-
-async fn fetch_beatmap(beatmap_id: u64) -> Result<Arc<Beatmap>, APIError> {
-  if let Some(beatmap) = BEATMAP_CACHE.get(&beatmap_id) {
-    crate::metrics::http_server::beatmap_cache_hits_total().inc();
-    return Ok(Arc::clone(&beatmap));
-  }
-  crate::metrics::http_server::beatmap_cache_misses_total().inc();
-
-  let beatmap = sqlx::query_scalar!(
-    "SELECT raw_beatmap_gzipped FROM fetched_beatmaps WHERE beatmap_id = ?",
-    beatmap_id
-  )
-  .fetch_optional(db_pool())
-  .await
-  .map_err(|err| APIError {
-    status: StatusCode::INTERNAL_SERVER_ERROR,
-    message: format!("Error fetching beatmap: {err}"),
-  })?;
-
-  let Some(beatmap) = beatmap else {
-    let beatmap = download_and_store_beatmap(beatmap_id).await?;
-    return Ok(insert_beatmap_into_cache(beatmap_id, beatmap));
-  };
-
-  decompress_and_parse_beatmap(beatmap_id, &beatmap)
-}
-
-pub(super) async fn fetch_beatmaps_cached_only(beatmap_ids: &[u64]) -> Vec<Option<Arc<Beatmap>>> {
-  let mut results: FxHashMap<u64, Option<Arc<Beatmap>>> = FxHashMap::default();
-  let mut missing_ids = Vec::new();
-
-  for &beatmap_id in beatmap_ids {
-    if let Some(beatmap) = BEATMAP_CACHE.get(&beatmap_id) {
-      crate::metrics::http_server::beatmap_cache_hits_total().inc();
-      results.insert(beatmap_id, Some(Arc::clone(&beatmap)));
-    } else {
-      crate::metrics::http_server::beatmap_cache_misses_total().inc();
-      missing_ids.push(beatmap_id);
-    }
-  }
-
-  if missing_ids.is_empty() {
-    return beatmap_ids
-      .iter()
-      .map(|id| results.get(id).unwrap().clone())
-      .collect();
-  }
-
-  let Ok(db_results) = fetch_beatmaps_from_db(&missing_ids).await else {
-    return beatmap_ids
-      .iter()
-      .map(|id| results.get(id).unwrap_or(&None).clone())
-      .collect();
-  };
-
-  let worker_count = missing_ids.len().min(num_cpus::get());
-  let work = Arc::new(SyncMutex::new(missing_ids));
-  let db_results = Arc::new(db_results);
-  let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-
-  for _ in 0..worker_count {
-    let work = Arc::clone(&work);
-    let tx = tx.clone();
-    let db_results = Arc::clone(&db_results);
-
-    tokio::task::spawn_blocking(move || loop {
-      let res = { work.lock().map(|mut ids| ids.pop()) };
-      let Ok(Some(beatmap_id)) = res else {
-        return;
-      };
-
-      let Some((_, raw_beatmap_gzipped)) =
-        db_results.iter().find(|(id, _)| *id == beatmap_id as i64)
-      else {
-        let _ = tx.blocking_send((beatmap_id, None));
-        continue;
-      };
-
-      let beatmap_opt = match decompress_and_parse_beatmap(beatmap_id, raw_beatmap_gzipped) {
-        Ok(beatmap) => Some(beatmap),
-        Err(err) => {
-          error!("Error processing beatmap {beatmap_id}: {}", err.message);
-          None
-        },
-      };
-
-      let Ok(()) = tx.blocking_send((beatmap_id, beatmap_opt)) else {
-        error!("rx went away for beatmap parsing worker");
-        return;
-      };
-    });
-  }
-
-  drop(tx);
-  while let Some((beatmap_id, beatmap_opt)) = rx.recv().await {
-    results.insert(beatmap_id, beatmap_opt);
-  }
-
-  beatmap_ids
-    .iter()
-    .map(|id| results.get(id).and_then(|opt| opt.clone()))
-    .collect()
-}
-
-pub(super) async fn fetch_and_store_beatmap(beatmap_id: u64) -> Result<Arc<Beatmap>, APIError> {
-  if let Some(beatmap) = BEATMAP_CACHE.get(&beatmap_id) {
-    crate::metrics::http_server::beatmap_cache_hits_total().inc();
-    return Ok(Arc::clone(&beatmap));
-  }
-  crate::metrics::http_server::beatmap_cache_misses_total().inc();
-
-  let db_result = sqlx::query_scalar!(
-    "SELECT raw_beatmap_gzipped FROM fetched_beatmaps WHERE beatmap_id = ?",
-    beatmap_id
-  )
-  .fetch_optional(db_pool())
-  .await
-  .map_err(|err| APIError {
-    status: StatusCode::INTERNAL_SERVER_ERROR,
-    message: format!("Error fetching beatmap: {err}"),
-  })?;
-
-  if let Some(raw_beatmap_gzipped) = db_result {
-    return decompress_and_parse_beatmap(beatmap_id, &raw_beatmap_gzipped);
-  }
-
-  let beatmap = download_and_store_beatmap(beatmap_id).await?;
-  Ok(insert_beatmap_into_cache(beatmap_id, beatmap))
-}
-
-fn compute_diff_attrs(
-  beatmap: &Beatmap,
-  mod_string: &str,
-  is_classic: bool,
-) -> Result<DifficultyAttributes, APIError> {
-  let mods = GameModsLegacy::from_str(mod_string).map_err(|err| APIError {
-    status: StatusCode::BAD_REQUEST,
-    message: format!("Invalid mods: {err}"),
-  })?;
-  Ok(
-    rosu_pp::Difficulty::new()
-      .mods(mods.bits())
-      .lazer(!is_classic)
-      .calculate(&beatmap),
-  )
-}
-
-async fn simulate_play(
-  diff_attrs: DifficultyAttributes,
-  params: &SimulatePlayQueryParams,
-) -> Result<f64, APIError> {
-  let mods =
-    GameModsLegacy::from_str(params.mods.as_deref().unwrap_or_default()).map_err(|err| {
-      APIError {
-        status: StatusCode::BAD_REQUEST,
-        message: format!("Invalid mods: {err}"),
-      }
-    })?;
-
-  let is_classic = params.is_classic.unwrap_or(true);
-  let mut perf = Performance::new(diff_attrs)
-    .mods(mods.bits())
-    .lazer(!is_classic);
-  if let Some(acc) = params.acc {
-    perf = perf.accuracy(acc);
-  }
-  if let Some(max_combo) = params.max_combo {
-    perf = perf.combo(max_combo);
-  }
-  if let Some(misses) = params.misses {
-    perf = perf.misses(misses);
-  }
-  if let Some(n300) = params.n300 {
-    perf = perf.n300(n300);
-  }
-  if let Some(n100) = params.n100 {
-    perf = perf.n100(n100);
-  }
-  if let Some(n50) = params.n50 {
-    perf = perf.n50(n50);
-  }
-
-  Ok(perf.calculate().pp())
+  // The sidecar has the authoritative CPU limit. This edge guard prevents public
+  // callers from creating an unbounded number of queued bridge requests.
+  static ref PUBLIC_SIMULATION_CONCURRENCY: Semaphore = Semaphore::new(16);
 }
 
 #[derive(Deserialize)]
@@ -414,22 +35,6 @@ pub(super) struct SimulatePlayResponse {
   pp: f64,
 }
 
-pub(super) async fn simulate_play_route(
-  Path(beatmap_id): Path<u64>,
-  Query(params): Query<SimulatePlayQueryParams>,
-) -> Result<Json<SimulatePlayResponse>, APIError> {
-  let beatmap = fetch_beatmap(beatmap_id).await?;
-  let is_classic = params.is_classic.unwrap_or(true);
-  let diff_attrs = compute_diff_attrs(
-    &beatmap,
-    params.mods.as_deref().unwrap_or_default(),
-    is_classic,
-  )?;
-  simulate_play(diff_attrs, &params)
-    .await
-    .map(|pp| Json(SimulatePlayResponse { pp }))
-}
-
 #[derive(Deserialize)]
 pub(super) struct BatchSimulatePlayParams {
   beatmap_id: u64,
@@ -441,41 +46,218 @@ pub(super) struct BatchSimulatePlayResponse {
   pp: Vec<f64>,
 }
 
-pub(super) async fn batch_simulate_play_route(
-  body: String,
-) -> Result<Json<BatchSimulatePlayResponse>, APIError> {
-  let BatchSimulatePlayParams { beatmap_id, params } =
-    serde_json::from_str(&body).map_err(|err| APIError {
-      status: StatusCode::BAD_REQUEST,
-      message: format!("Error parsing request body: {err}"),
-    })?;
+fn bad_request(message: impl Into<String>) -> APIError {
+  APIError {
+    status: StatusCode::BAD_REQUEST,
+    message: message.into(),
+  }
+}
 
-  let beatmap = fetch_beatmap(beatmap_id).await?;
-  let Some(first_params) = params.first() else {
-    return Ok(Json(BatchSimulatePlayResponse { pp: Vec::new() }));
-  };
-  let mut last_mods = first_params.mods.clone();
-  let is_classic = first_params.is_classic.unwrap_or(true);
-  let mut diff_attrs = compute_diff_attrs(
-    &beatmap,
-    last_mods.as_deref().unwrap_or_default(),
-    is_classic,
-  )?;
-  let mut pps = Vec::new();
-  for params in params {
-    if params.mods != last_mods {
-      last_mods = params.mods.clone();
-      let is_classic = params.is_classic.unwrap_or(true);
-      diff_attrs = compute_diff_attrs(
-        &beatmap,
-        last_mods.as_deref().unwrap_or_default(),
-        is_classic,
-      )?;
-    }
+fn parse_beatmap_id(beatmap_id: u64) -> Result<i32, APIError> {
+  i32::try_from(beatmap_id)
+    .ok()
+    .filter(|id| *id > 0)
+    .ok_or_else(|| bad_request("beatmap_id must be a positive 32-bit integer"))
+}
 
-    let pp = simulate_play(diff_attrs.clone(), &params).await?;
-    pps.push(pp);
+fn parse_mods(mod_string: Option<&str>) -> Result<Vec<Mod>, APIError> {
+  let mod_string = mod_string.unwrap_or_default().trim().to_ascii_uppercase();
+  if mod_string.len() > 32
+    || mod_string.len() % 2 != 0
+    || !mod_string.bytes().all(|byte| byte.is_ascii_alphanumeric())
+  {
+    return Err(bad_request(
+      "mods must contain at most 16 two-character acronyms",
+    ));
   }
 
-  Ok(Json(BatchSimulatePlayResponse { pp: pps }))
+  let mut seen = HashSet::new();
+  mod_string
+    .as_bytes()
+    .chunks_exact(2)
+    .map(|chunk| {
+      let acronym = std::str::from_utf8(chunk)
+        .expect("validated ASCII")
+        .to_owned();
+      if !seen.insert(acronym.clone()) {
+        return Err(bad_request(format!("duplicate mod acronym: {acronym}")));
+      }
+      Ok(Mod {
+        acronym,
+        settings: None,
+      })
+    })
+    .collect()
+}
+
+fn checked_count(name: &str, value: Option<u32>) -> Result<Option<u32>, APIError> {
+  if value > Some(MAX_PUBLIC_COUNT) {
+    return Err(bad_request(format!("{name} exceeds {MAX_PUBLIC_COUNT}")));
+  }
+  Ok(value)
+}
+
+fn to_calculation(
+  beatmap_id: i32,
+  params: SimulatePlayQueryParams,
+  request_id: Option<String>,
+) -> Result<CalculationRequest, APIError> {
+  let acc = params.acc.unwrap_or(100.0);
+  if !acc.is_finite() || !(0.0..=100.0).contains(&acc) {
+    return Err(bad_request("acc must be finite and in [0, 100]"));
+  }
+
+  let max_combo = checked_count("max_combo", params.max_combo)?;
+  let misses = checked_count("misses", params.misses)?.unwrap_or(0);
+  let n300 = checked_count("n300", params.n300)?;
+  let n100 = checked_count("n100", params.n100)?;
+  let n50 = checked_count("n50", params.n50)?;
+  let supplied_counts = [n300, n100, n50];
+  if supplied_counts.iter().any(Option::is_some) && supplied_counts.iter().any(Option::is_none) {
+    return Err(bad_request("n300, n100, and n50 must be supplied together"));
+  }
+
+  Ok(CalculationRequest {
+    request_id,
+    beatmap_id,
+    mods: parse_mods(params.mods.as_deref())?,
+    is_classic: params.is_classic.unwrap_or(true),
+    score: Some(ScoreInput {
+      accuracy: acc,
+      max_combo,
+      legacy_total_score: None,
+      statistics: Some(ScoreStatisticsInput {
+        great: n300,
+        ok: n100,
+        meh: n50,
+        miss: misses,
+        large_tick_hit: None,
+        large_tick_miss: None,
+        small_tick_hit: None,
+        small_tick_miss: None,
+        slider_tail_hit: None,
+        large_bonus: None,
+        small_bonus: None,
+      }),
+    }),
+  })
+}
+
+fn result_pp(result: diffcalc::CalculationResult) -> Result<f64, APIError> {
+  if let Some(err) = result.error {
+    warn!(
+      "diffcalc rejected beatmap {} request {:?}: {}: {}",
+      result.beatmap_id, result.request_id, err.code, err.message
+    );
+    let status = match err.code.as_str() {
+      "beatmap_not_found" => StatusCode::NOT_FOUND,
+      "invalid_calculation" => StatusCode::BAD_REQUEST,
+      "calculation_timeout" => StatusCode::GATEWAY_TIMEOUT,
+      _ => StatusCode::BAD_GATEWAY,
+    };
+    return Err(APIError {
+      status,
+      message: err.message,
+    });
+  }
+
+  result
+    .performance
+    .map(|performance| performance.pp)
+    .ok_or_else(|| APIError {
+      status: StatusCode::BAD_GATEWAY,
+      message: "Difficulty calculation service omitted performance attributes".to_owned(),
+    })
+}
+
+fn acquire_public_permit() -> Result<tokio::sync::SemaphorePermit<'static>, APIError> {
+  PUBLIC_SIMULATION_CONCURRENCY.try_acquire().map_err(|_| {
+    crate::metrics::http_server::simulation_rejections_total("concurrency").inc();
+    APIError {
+      status: StatusCode::TOO_MANY_REQUESTS,
+      message: "Too many concurrent simulation requests".to_owned(),
+    }
+  })
+}
+
+pub(super) async fn simulate_play_route(
+  Path(beatmap_id): Path<u64>,
+  Query(params): Query<SimulatePlayQueryParams>,
+) -> Result<Json<SimulatePlayResponse>, APIError> {
+  let _permit = acquire_public_permit()?;
+  let request = to_calculation(parse_beatmap_id(beatmap_id)?, params, None)?;
+  let mut results =
+    diffcalc::calculate_all(diffcalc::Operation::SimulateSingle, vec![request]).await?;
+  let result = results.pop().ok_or_else(|| APIError {
+    status: StatusCode::BAD_GATEWAY,
+    message: "Difficulty calculation service returned no result".to_owned(),
+  })?;
+  Ok(Json(SimulatePlayResponse {
+    pp: result_pp(result)?,
+  }))
+}
+
+pub(super) async fn batch_simulate_play_route(
+  Path(path_beatmap_id): Path<u64>,
+  body: String,
+) -> Result<Json<BatchSimulatePlayResponse>, APIError> {
+  let _permit = acquire_public_permit()?;
+  let BatchSimulatePlayParams { beatmap_id, params } = serde_json::from_str(&body)
+    .map_err(|err| bad_request(format!("Error parsing request body: {err}")))?;
+
+  if beatmap_id != path_beatmap_id {
+    return Err(bad_request("body beatmap_id must match the URL"));
+  }
+  if params.len() > MAX_PUBLIC_BATCH_SIZE {
+    crate::metrics::http_server::simulation_rejections_total("batch_size").inc();
+    return Err(bad_request(format!(
+      "params exceeds the maximum batch size of {MAX_PUBLIC_BATCH_SIZE}"
+    )));
+  }
+
+  let beatmap_id = parse_beatmap_id(beatmap_id)?;
+  let requests = params
+    .into_iter()
+    .enumerate()
+    .map(|(index, params)| to_calculation(beatmap_id, params, Some(index.to_string())))
+    .collect::<Result<Vec<_>, _>>()?;
+  let results = diffcalc::calculate_all(diffcalc::Operation::SimulateBatch, requests).await?;
+  let pp = results
+    .into_iter()
+    .map(result_pp)
+    .collect::<Result<Vec<_>, _>>()?;
+  Ok(Json(BatchSimulatePlayResponse { pp }))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn parses_compact_mod_strings() {
+    let mods = parse_mods(Some("hddt")).unwrap();
+    assert_eq!(
+      mods.iter().map(|m| m.acronym.as_str()).collect::<Vec<_>>(),
+      ["HD", "DT"]
+    );
+  }
+
+  #[test]
+  fn rejects_ambiguous_partial_hit_counts() {
+    let result = to_calculation(
+      75,
+      SimulatePlayQueryParams {
+        mods: None,
+        is_classic: None,
+        max_combo: None,
+        acc: Some(98.0),
+        misses: None,
+        n300: None,
+        n100: Some(1),
+        n50: None,
+      },
+      None,
+    );
+    assert!(result.is_err());
+  }
 }

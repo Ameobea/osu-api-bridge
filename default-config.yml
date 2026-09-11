@@ -36,5 +36,10 @@ osu_client_secret: ""
 analytics_salt: "default-salt-change-me"
 sql:
   db_url: ""
+diffcalc:
+  url: "http://127.0.0.1:4512"
+  api_key: ""
+  max_batch_size: 256
+  request_timeout_ms: 20000
 daily_challenge:
   admin_token: ""

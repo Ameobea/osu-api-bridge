@@ -15,6 +15,8 @@ use settings::ServerSettings;
 
 #[cfg(feature = "sql")]
 mod db;
+#[cfg(feature = "simulate_play")]
+mod diffcalc;
 mod metrics;
 mod mods;
 mod oauth;
