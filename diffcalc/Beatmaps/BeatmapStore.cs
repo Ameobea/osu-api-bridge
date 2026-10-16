@@ -43,10 +43,44 @@ public sealed class BeatmapStore
         if (compressed is null)
             compressed = await DownloadAndStoreAsync(beatmapId, operation, cancellationToken);
 
+        return await DecompressAsync(compressed, operation, cancellationToken);
+    }
+
+    public async Task<byte[]> DecompressAsync(byte[] compressed, string operation, CancellationToken cancellationToken)
+    {
         using var timer = DiffCalcMetrics.BeatmapDecompressionDuration.WithLabels(operation).NewTimer();
         await using var input = new MemoryStream(compressed, writable: false);
         await using var gzip = new GZipStream(input, CompressionMode.Decompress);
         return await ReadBoundedAsync(gzip, options.MaxDecompressedBeatmapBytes, cancellationToken);
+    }
+
+    /// <summary>One query for many beatmaps: a batch costs a single database round trip instead of one per beatmap.</summary>
+    public async Task<Dictionary<int, byte[]>> LoadCompressedManyAsync(
+        IReadOnlyCollection<int> beatmapIds,
+        string operation,
+        CancellationToken cancellationToken)
+    {
+        using var timer = DiffCalcMetrics.BeatmapDatabaseDuration.WithLabels(operation, "load_batch").NewTimer();
+        try
+        {
+            await using var connection = new MySqlConnection(connectionString);
+            await connection.OpenAsync(cancellationToken);
+            await using var command = new MySqlCommand(
+                $"SELECT beatmap_id, raw_beatmap_gzipped FROM fetched_beatmaps WHERE beatmap_id IN ({string.Join(',', beatmapIds)})",
+                connection);
+            var found = new Dictionary<int, byte[]>(beatmapIds.Count);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+                found[reader.GetInt32(0)] = (byte[])reader[1];
+            DiffCalcMetrics.BeatmapDatabaseOperations.WithLabels(operation, "load_batch", "hit").Inc(found.Count);
+            DiffCalcMetrics.BeatmapDatabaseOperations.WithLabels(operation, "load_batch", "miss").Inc(beatmapIds.Count - found.Count);
+            return found;
+        }
+        catch
+        {
+            DiffCalcMetrics.BeatmapDatabaseOperations.WithLabels(operation, "load_batch", "error").Inc();
+            throw;
+        }
     }
 
     public async Task<bool> CanConnectAsync(CancellationToken cancellationToken)

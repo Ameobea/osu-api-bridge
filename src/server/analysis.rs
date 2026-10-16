@@ -17,7 +17,7 @@ use axum::{
 };
 use chrono::NaiveDate;
 use dashmap::DashMap;
-use fxhash::{FxHashMap, FxHashSet};
+
 use image::{codecs::png::PngEncoder, ExtendedColorType, ImageEncoder, RgbImage};
 use lazy_static::lazy_static;
 use pco::{standalone::simple_compress, ChunkConfig, DeltaSpec, ModeSpec};
@@ -35,6 +35,9 @@ pub struct SimulationProfile {
   pub rank_to_decay: Vec<(u32, f32)>,
   pub rank_to_density: Vec<(u32, f32)>,
   pub rank_to_pp: Vec<(u32, f32)>,
+  /// Largest bucket before pp drops below `MIN_RELIABLE_PP`; ranks past it are tail noise for
+  /// this mode and shouldn't be selectable.
+  pub max_rank: u32,
 }
 
 #[derive(Clone, Serialize)]
@@ -222,12 +225,6 @@ fn build_target_ranks() -> Vec<u32> {
 
 pub fn target_ranks() -> &'static [u32] { &TARGET_RANKS }
 
-#[derive(Debug, FromRow)]
-pub struct RankSample {
-  pub rank: u32,
-  pub pp: f32,
-}
-
 /// Represents a sparse snapshot with optional PP values for each rank bucket.
 #[derive(Debug, Clone)]
 pub struct SparseSnapshot {
@@ -243,63 +240,52 @@ pub struct SparseSnapshot {
 #[derive(Debug, FromRow)]
 pub struct RankSampleWithDate {
   pub date: NaiveDate,
+  pub user: u32,
+  pub ts: i64,
   pub rank: u32,
   pub pp: f32,
 }
 
-/// Given a set of rank samples that fall within a rank bucket, estimates the PP at the center of
-/// the bucket (`target_rank`).
-///
-/// This is done by assuming that the PP vs Rank relationship within the bucket is roughly linear
-/// and fitting a line to the samples then using that line to compute the PP at the target rank.
-fn estimate_bucket_center_pp(samples: &[RankSample], target_rank: u32) -> f32 {
-  if samples.is_empty() {
-    return 0.;
+/// Fits a line to the (rank, pp) samples within a bucket and returns its value at `target_rank`,
+/// falling back to the mean when a line can't be fit.  Ranks are centered on the target so the
+/// intercept is the answer directly and the sums stay well-conditioned at high ranks.
+fn estimate_bucket_center_pp(samples: &[RankSampleWithDate], target_rank: u32) -> f32 {
+  let n = samples.len() as f64;
+  let mean_pp = samples.iter().map(|s| s.pp as f64).sum::<f64>() / n;
+  if samples.iter().all(|s| s.rank == samples[0].rank) {
+    return mean_pp as f32;
   }
 
-  if samples.len() == 1 {
-    return samples[0].pp;
+  let (mut sx, mut sxx, mut sxy) = (0f64, 0f64, 0f64);
+  for s in samples {
+    let x = s.rank as f64 - target_rank as f64;
+    sx += x;
+    sxx += x * x;
+    sxy += x * (s.pp as f64 - mean_pp);
   }
-
-  // A line requires at least two unique rank points to fit.  If we don't have that, the best we can
-  // do is just average the PP values.
-  //
-  // It might be possible to do something more sophisticated by looking at neighboring buckets along
-  // either/both the X/Y axis, but that's not really necessary for now thanks to the filtering
-  // that's done on the resulting matrix before further analysis.
-  let first_rank = samples[0].rank;
-  let more_than_one_unique_rank = samples.iter().skip(1).all(|s| s.rank != first_rank);
-  if !more_than_one_unique_rank {
-    return samples.iter().map(|s| s.pp).sum::<f32>() / samples.len() as f32;
+  let den = n * sxx - sx * sx;
+  if den.abs() < 1e-9 {
+    return mean_pp as f32;
   }
-
-  let n = samples.len() as f32;
-  let sum_rank: f32 = samples.iter().map(|s| s.rank as f32).sum();
-  let sum_pp: f32 = samples.iter().map(|s| s.pp).sum();
-  let sum_rank_pp: f32 = samples.iter().map(|s| s.rank as f32 * s.pp).sum();
-  let sum_rank_sq: f32 = samples.iter().map(|s| (s.rank as f32).powi(2)).sum();
-
-  let mean_rank = sum_rank / n;
-  let mean_pp = sum_pp / n;
-
-  let numerator = n * sum_rank_pp - sum_rank * sum_pp;
-  let denominator = n * sum_rank_sq - sum_rank.powi(2);
-
-  if denominator.abs() < 1e-10 {
-    return mean_pp;
+  let slope = n * sxy / den;
+  let fitted = mean_pp - slope * sx / n;
+  if fitted > 0. {
+    fitted as f32
+  } else {
+    mean_pp as f32
   }
-
-  // solving for y = mx + b
-  let slope = numerator / denominator;
-  let intercept = mean_pp - slope * mean_rank;
-
-  slope * target_rank as f32 + intercept
 }
+
+/// On days with fewer samples than this in a bucket (the sparse 2014-2016 era), the bucket is
+/// widened by these multiples of its normal half-width so the fit isn't driven by one or two
+/// points.
+const MIN_BUCKET_SAMPLES: usize = 6;
+const BUCKET_WIDEN_FACTORS: [f32; 2] = [2.5, 5.];
 
 /// Compute a sparse snapshot from raw samples without any interpolation.
 /// Missing rank buckets are left as None.
 fn compute_sparse_snapshot(
-  samples: &[RankSample],
+  samples: &[RankSampleWithDate],
   mode: Ruleset,
   date: NaiveDate,
 ) -> Option<SparseSnapshot> {
@@ -335,7 +321,22 @@ fn compute_sparse_snapshot(
       end_ix += 1;
     }
 
-    let slice = &samples[start_ix..end_ix];
+    let mut slice = &samples[start_ix..end_ix];
+    if slice.len() < MIN_BUCKET_SAMPLES && window > 0 {
+      for &factor in &BUCKET_WIDEN_FACTORS {
+        let wide = ((window as f32 * factor) as u32).max(1);
+        let lo = target_rank.saturating_sub(wide);
+        let hi = target_rank.saturating_add(wide);
+        let s = samples.partition_point(|x| x.rank < lo);
+        let e = samples.partition_point(|x| x.rank <= hi);
+        if e - s > slice.len() {
+          slice = &samples[s..e];
+        }
+        if slice.len() >= MIN_BUCKET_SAMPLES {
+          break;
+        }
+      }
+    }
     if slice.is_empty() {
       continue;
     }
@@ -364,8 +365,9 @@ pub async fn fetch_rank_samples(mode: Ruleset) -> Result<Vec<RankSampleWithDate>
   info!("Fetching (rank, pp) samples for mode={mode:?}");
 
   sqlx::query_as(
-    "SELECT DATE(timestamp) as date, CAST(pp_rank as UNSIGNED) as rank, pp_raw as pp FROM updates \
-     WHERE mode = ? AND pp_rank > 0 AND pp_raw > 0 ORDER BY date ASC, pp_rank ASC",
+    "SELECT DATE(timestamp) as date, CAST(`user` AS UNSIGNED) as user, \
+     CAST(UNIX_TIMESTAMP(timestamp) AS SIGNED) as ts, CAST(pp_rank as UNSIGNED) as rank, pp_raw \
+     as pp FROM updates WHERE mode = ? AND pp_rank > 0 AND pp_raw > 0",
   )
   .bind(mode.mode_value())
   .fetch_all(pool)
@@ -516,166 +518,175 @@ pub fn interpolate_snapshots_across_time(snapshots: &[SparseSnapshot]) -> Vec<Sp
   interpolated_snapshots
 }
 
-fn detect_shocks(
+/// A day is a shock when the median day-over-day log change of pp across the mid-ladder buckets
+/// exceeds this.  Normal drift is ~0.01-0.1%/day; pp reworks and inactive purges move the whole
+/// ladder 0.3-4% in a day.
+const SHOCK_THRESHOLD: f64 = 0.003;
+const SHOCK_MIN_RANK: u32 = 1_000;
+const SHOCK_MAX_RANK: u32 = 500_000;
+/// Shock days this close together are one event (a rollout with quiet days in between); the quiet
+/// days have windows too short to estimate anything from anyway.
+const SHOCK_MERGE_GAP_DAYS: usize = 3;
+
+/// Inclusive `[start, end]` day index ranges of consecutive shock days.  Recalculations that roll
+/// out over several days become a single interval.
+fn detect_shock_intervals(
   pp_matrix: &[f32],
-  dates: &[NaiveDate],
   buckets: &[u32],
-  threshold_z: f32,
-) -> Vec<usize> {
-  let ranks = [1000, 2000, 50000, 200000];
-  let max_rank = buckets.last().copied().unwrap_or(0);
+  num_days: usize,
+) -> Vec<(usize, usize)> {
+  let num_buckets = buckets.len();
+  let mid: Vec<usize> = (0..num_buckets)
+    .filter(|&b| (SHOCK_MIN_RANK..=SHOCK_MAX_RANK).contains(&buckets[b]))
+    .collect();
 
-  let mut global_shocks = FxHashSet::default();
-
-  for r in ranks {
-    if r > max_rank {
+  let mut intervals: Vec<(usize, usize)> = Vec::new();
+  let mut changes = Vec::with_capacity(mid.len());
+  for day in 1..num_days {
+    changes.clear();
+    for &b in &mid {
+      let prev = pp_matrix[(day - 1) * num_buckets + b];
+      let cur = pp_matrix[day * num_buckets + b];
+      if prev > 0. && cur > 0. {
+        changes.push((cur as f64 / prev as f64).ln());
+      }
+    }
+    if changes.len() < 10 {
       continue;
     }
-
-    let pp_hist = get_history_for_rank(r, pp_matrix, dates, buckets);
-    // Calculate percentage change day-over-day
-    let mut pct_changes = Vec::with_capacity(pp_hist.len());
-    for i in 0..pp_hist.len() {
-      if i == 0 {
-        pct_changes.push(0.);
-        continue;
-      }
-
-      let prev = pp_hist[i - 1].1;
-      let curr = pp_hist[i].1;
-      if prev.abs() < 1e-6 {
-        pct_changes.push(0.);
-      } else {
-        pct_changes.push((curr - prev) / prev);
-      }
-    }
-
-    let n = pct_changes.len() as f32;
-    let mean: f32 = pct_changes.iter().sum::<f32>() / n;
-    // Use sample standard deviation (N-1) to match Pandas default
-    let std_dev: f32 = if n > 1. {
-      (pct_changes.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / (n - 1.)).sqrt()
+    changes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = changes.len();
+    let median = if n % 2 == 0 {
+      (changes[n / 2 - 1] + changes[n / 2]) / 2.
     } else {
-      0.
+      changes[n / 2]
     };
-
-    for (idx, &pct_change) in pct_changes.iter().enumerate() {
-      let z_score = if std_dev.abs() < 1e-6 {
-        0.
-      } else {
-        (pct_change - mean) / std_dev
-      };
-
-      if z_score.abs() > threshold_z {
-        global_shocks.insert(idx);
-      }
+    if median.abs() <= SHOCK_THRESHOLD {
+      continue;
+    }
+    match intervals.last_mut() {
+      Some((_, end)) if day <= *end + 1 + SHOCK_MERGE_GAP_DAYS => *end = day,
+      _ => intervals.push((day, day)),
     }
   }
+  intervals
+}
 
-  let mut shock_list: Vec<usize> = global_shocks.into_iter().collect();
-  shock_list.sort_unstable();
-  shock_list
+/// `[start, end]` window of `radius` days around `day` that never crosses a shock interval, or
+/// `None` when `day` is inside one.  The last day of an interval is already fully post-shock, so it
+/// is where windows for the days after it begin.
+fn clamped_window(
+  day: usize,
+  radius: usize,
+  num_days: usize,
+  intervals: &[(usize, usize)],
+) -> Option<(usize, usize)> {
+  let mut start = day.saturating_sub(radius);
+  let mut end = (day + radius).min(num_days - 1);
+  for &(a, b) in intervals {
+    if a <= day && day <= b {
+      return None;
+    }
+    if b < day {
+      start = start.max(b);
+    }
+    if a > day {
+      end = end.min(a - 1);
+      break;
+    }
+  }
+  Some((start, end))
 }
 
 pub async fn rebuild_analysis_data(mode: Ruleset) -> Result<AnalysisData, APIError> {
-  let samples = fetch_rank_samples(mode).await.map_err(|e| APIError {
+  let mut samples = fetch_rank_samples(mode).await.map_err(|e| APIError {
     status: StatusCode::INTERNAL_SERVER_ERROR,
     message: format!("Failed to fetch samples: {}", e.message),
   })?;
-
-  let mut samples_by_date: FxHashMap<NaiveDate, Vec<RankSample>> = FxHashMap::default();
-  for sample in samples {
-    samples_by_date
-      .entry(sample.date)
-      .or_default()
-      .push(RankSample {
-        rank: sample.rank,
-        pp: sample.pp,
-      });
-  }
-
-  if samples_by_date.is_empty() {
+  if samples.is_empty() {
     return Err(APIError {
       status: StatusCode::INTERNAL_SERVER_ERROR,
       message: "No rank samples available for analysis".to_owned(),
     });
   }
 
-  // let mut all_dates = samples_by_date.keys().cloned().collect::<Vec<NaiveDate>>();
-  // all_dates.sort_unstable();
+  let first_date = samples.iter().map(|s| s.date).min().unwrap();
+  let last_date = samples.iter().map(|s| s.date).max().unwrap();
+  let num_days = (last_date - first_date).num_days() as usize + 1;
+  let all_dates: Vec<NaiveDate> = (0..num_days)
+    .map(|i| first_date + chrono::Duration::days(i as i64))
+    .collect();
 
-  // Just in case there was somehow a date gap in the samples, fill in missing dates with empty
-  // samples. let first_date = *samples_by_date.keys().min().unwrap();
-  // let last_date = *samples_by_date.keys().max().unwrap();
+  let buckets = target_ranks().to_vec();
+  let num_buckets = buckets.len();
 
-  let (first_date, last_date) = samples_by_date.keys().fold(
-    (
-      NaiveDate::from_ymd_opt(3000, 1, 1).unwrap(),
-      NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-    ),
-    |(min_date, max_date), &date| {
-      (
-        if date < min_date { date } else { min_date },
-        if date > max_date { date } else { max_date },
-      )
-    },
-  );
-
-  let mut all_dates = Vec::new();
-  let mut current_date = first_date;
-  while current_date <= last_date {
-    all_dates.push(current_date);
-    current_date = current_date.succ_opt().unwrap();
-  }
-
-  let mut sparse_snapshots = Vec::new();
-  for &date in &all_dates {
-    let Some(daily_samples) = samples_by_date.get(&date) else {
-      sparse_snapshots.push(SparseSnapshot {
-        date,
-        mode,
-        bucket_values: vec![None; target_ranks().len()],
-        rows_scanned: 0,
-        buckets_from_samples: 0,
-      });
-      continue;
-    };
-
-    if let Some(sparse) = compute_sparse_snapshot(daily_samples, mode, date) {
-      sparse_snapshots.push(sparse);
-    } else {
-      sparse_snapshots.push(SparseSnapshot {
-        date,
-        mode,
-        bucket_values: vec![None; target_ranks().len()],
-        rows_scanned: 0,
-        buckets_from_samples: 0,
-      });
+  samples.sort_unstable_by_key(|s| (s.date, s.rank));
+  let mut sparse_snapshots: Vec<SparseSnapshot> = all_dates
+    .iter()
+    .map(|&date| SparseSnapshot {
+      date,
+      mode,
+      bucket_values: vec![None; num_buckets],
+      rows_scanned: 0,
+      buckets_from_samples: 0,
+    })
+    .collect();
+  let mut start = 0;
+  while start < samples.len() {
+    let date = samples[start].date;
+    let end = start + samples[start..].partition_point(|s| s.date == date);
+    if let Some(snapshot) = compute_sparse_snapshot(&samples[start..end], mode, date) {
+      sparse_snapshots[(date - first_date).num_days() as usize] = snapshot;
     }
+    start = end;
   }
 
   let interpolated = interpolate_snapshots_across_time(&sparse_snapshots);
+  drop(sparse_snapshots);
+  let pp_matrix: Vec<f32> = interpolated
+    .iter()
+    .flat_map(|s| s.bucket_values.iter().map(|v| v.unwrap_or(0.)))
+    .collect();
+  drop(interpolated);
 
-  // Convert to dense matrix
-  let buckets = target_ranks().to_vec();
-  let num_buckets = buckets.len();
-  let num_days = all_dates.len();
-  let mut pp_matrix = Vec::with_capacity(num_days * buckets.len());
+  let shock_intervals = detect_shock_intervals(&pp_matrix, &buckets, num_days);
+  info!(
+    "{mode:?}: {} shock intervals: {:?}",
+    shock_intervals.len(),
+    shock_intervals
+      .iter()
+      .map(|&(a, b)| (all_dates[a], all_dates[b]))
+      .collect::<Vec<_>>()
+  );
 
-  for snapshot in &interpolated {
-    for val in &snapshot.bucket_values {
-      pp_matrix.push(val.unwrap_or(0.));
-    }
-  }
+  let smoothed_pp_matrix = smooth_matrix(&pp_matrix, num_buckets, num_days, &shock_intervals, 7);
+  drop(pp_matrix);
+  let surface_decay = calculate_surface_decay(
+    &smoothed_pp_matrix,
+    &buckets,
+    num_days,
+    &shock_intervals,
+    24,
+  );
 
-  let shocks = detect_shocks(&pp_matrix, &all_dates, &buckets, 3.);
-
-  let smoothed_pp_matrix = smooth_matrix(&pp_matrix, num_buckets, num_days, &shocks, 7);
-
-  let decay_matrix = calculate_decay(&smoothed_pp_matrix, &buckets, num_days, &shocks, 24);
+  samples.sort_unstable_by_key(|s| (s.user, s.ts));
+  let mut pairs = build_same_pp_pairs(&samples, first_date, num_days, &shock_intervals);
+  drop(samples);
+  info!("{mode:?}: {} same-pp update pairs", pairs.len());
+  let (direct_decay, direct_counts) = calculate_direct_decay(&mut pairs, &buckets, num_days);
+  drop(pairs);
+  let (direct_decay, direct_counts) = smooth_direct_decay(
+    &direct_decay,
+    &direct_counts,
+    num_buckets,
+    num_days,
+    &shock_intervals,
+    7,
+  );
+  let decay_matrix = blend_decay(&surface_decay, &direct_decay, &direct_counts);
 
   let simulation_profile =
-    generate_simulation_profile(&smoothed_pp_matrix, &buckets, num_days, &shocks);
+    generate_simulation_profile(&smoothed_pp_matrix, &decay_matrix, &buckets, num_days);
 
   let mut data = AnalysisData {
     dates: all_dates,
@@ -690,34 +701,22 @@ pub async fn rebuild_analysis_data(mode: Ruleset) -> Result<AnalysisData, APIErr
   Ok(data)
 }
 
+/// Triangular-weighted smoothing along time, never reaching across a shock interval.  Days inside
+/// an interval keep their raw values.
 fn smooth_matrix(
   pp_matrix: &[f32],
   num_buckets: usize,
   num_days: usize,
-  shocks: &[usize],
+  shock_intervals: &[(usize, usize)],
   window_radius: usize,
 ) -> Vec<f32> {
-  let mut smoothed = vec![0.; pp_matrix.len()];
+  let mut smoothed = pp_matrix.to_vec();
 
   for i in 0..num_days {
-    let mut start_idx = i.saturating_sub(window_radius);
-    let mut end_idx = (i + window_radius).min(num_days - 1);
-
-    // Check for shocks in the future part of the window
-    for &shock in shocks {
-      if i < shock && shock <= end_idx {
-        end_idx = shock - 1;
-        break;
-      }
-    }
-
-    // Check for shocks in the past part of the window
-    for &shock in shocks.iter().rev() {
-      if start_idx <= shock && shock < i {
-        start_idx = shock;
-        break;
-      }
-    }
+    let Some((start_idx, end_idx)) = clamped_window(i, window_radius, num_days, shock_intervals)
+    else {
+      continue;
+    };
 
     let window_len = end_idx - start_idx + 1;
     let window_size = window_len as f32;
@@ -757,88 +756,227 @@ fn smooth_matrix(
 }
 
 fn linear_slope(points: &[(f32, f32)]) -> f32 {
-  let n = points.len() as f32;
-  let sum_x: f32 = points.iter().map(|p| p.0).sum();
-  let sum_y: f32 = points.iter().map(|p| p.1).sum();
-  let sum_xy: f32 = points.iter().map(|p| p.0 * p.1).sum();
-  let sum_xx: f32 = points.iter().map(|p| p.0 * p.0).sum();
-
-  let numerator = n * sum_xy - sum_x * sum_y;
-  let denominator = n * sum_xx - sum_x * sum_x;
-
-  if denominator.abs() < 1e-9 {
+  let n = points.len() as f64;
+  let mean_x = points.iter().map(|p| p.0 as f64).sum::<f64>() / n;
+  let mean_y = points.iter().map(|p| p.1 as f64).sum::<f64>() / n;
+  let (mut sxx, mut sxy) = (0f64, 0f64);
+  for &(x, y) in points {
+    let dx = x as f64 - mean_x;
+    sxx += dx * dx;
+    sxy += dx * (y as f64 - mean_y);
+  }
+  if sxx < 1e-9 {
     0.
   } else {
-    numerator / denominator
+    (sxy / sxx) as f32
   }
 }
 
-fn calculate_decay(
+/// Decay derived from the pp surface: for each (day, bucket), the slope of the rank that the
+/// bucket's pp maps to across the surrounding days.  NaN where the window is inside or too close to
+/// a shock interval.
+fn calculate_surface_decay(
   pp_matrix: &[f32],
   buckets: &[u32],
   num_days: usize,
-  shocks: &[usize],
+  shock_intervals: &[(usize, usize)],
   window_radius: usize,
 ) -> Vec<f32> {
   let num_buckets = buckets.len();
-  // Initialize with NaN so that missing/skipped days are not treated as 0 decay
   let mut decay_matrix = vec![f32::NAN; pp_matrix.len()];
+  let mut points = Vec::with_capacity(2 * window_radius + 1);
 
   for day in 0..num_days {
-    // Determine window [start_idx, end_idx]
-    let mut start_idx = day.saturating_sub(window_radius);
-    let mut end_idx = (day + window_radius).min(num_days - 1);
-
-    // Windows are clamped by shocks.  This helps reduce the impact of pp reworks, inactive account
-    // purges, or other standalone events from getting smeared into the natural daily decay rate
-    // caused by players farming.
-
-    // Check for shocks in future
-    for &shock in shocks {
-      if day < shock && shock <= end_idx {
-        end_idx = shock - 1;
-        break;
-      }
-    }
-    // Check for shocks in past
-    for &shock in shocks.iter().rev() {
-      if start_idx <= shock && shock < day {
-        start_idx = shock;
-        break;
-      }
-    }
-
+    let Some((start_idx, end_idx)) = clamped_window(day, window_radius, num_days, shock_intervals)
+    else {
+      continue;
+    };
     if end_idx < start_idx + 3 {
       continue;
     }
 
     for bucket_idx in 0..num_buckets {
       let current_pp = pp_matrix[day * num_buckets + bucket_idx];
-
-      // Collect (x, y) points
-      let mut points = Vec::with_capacity(end_idx - start_idx + 1);
+      points.clear();
       for d in start_idx..=end_idx {
         let pp_row = &pp_matrix[d * num_buckets..(d + 1) * num_buckets];
-        let rank = get_rank_for_pp(pp_row, buckets, current_pp);
-        points.push((d as f32, rank));
+        points.push((d as f32, get_rank_for_pp(pp_row, buckets, current_pp)));
       }
 
-      // Linear regression
-      if points.len() > 1 {
-        let mut slope = linear_slope(&points);
-
-        if bucket_idx == 0 {
-          if slope < 0. {
-            slope = 0.;
-          }
-        }
-
-        decay_matrix[day * num_buckets + bucket_idx] = slope;
+      let mut slope = linear_slope(&points);
+      if bucket_idx == 0 && slope < 0. {
+        slope = 0.;
       }
+      decay_matrix[day * num_buckets + bucket_idx] = slope;
     }
   }
 
   decay_matrix
+}
+
+struct SamePpPair {
+  rank: u32,
+  start_day: u32,
+  end_day: u32,
+  /// ranks lost per day over the pair's span
+  rate: f32,
+}
+
+const PAIR_MIN_DAYS: f32 = 1.;
+const PAIR_MAX_DAYS: f32 = 45.;
+
+/// Consecutive updates of one user whose pp didn't change measure ladder drift directly: the rank
+/// change over the gap is pure decay at that pp.  Pairs whose span touches a shock interval are
+/// dropped so reworks and purges don't leak into the rate.  `samples` must be sorted by (user, ts).
+fn build_same_pp_pairs(
+  samples: &[RankSampleWithDate],
+  first_date: NaiveDate,
+  num_days: usize,
+  shock_intervals: &[(usize, usize)],
+) -> Vec<SamePpPair> {
+  let mut shock_prefix = vec![0u32; num_days + 1];
+  for day in 0..num_days {
+    let is_shock = shock_intervals.iter().any(|&(a, b)| a <= day && day <= b);
+    shock_prefix[day + 1] = shock_prefix[day] + is_shock as u32;
+  }
+
+  let mut pairs = Vec::new();
+  for w in samples.windows(2) {
+    let (a, b) = (&w[0], &w[1]);
+    if a.user != b.user || (a.pp - b.pp).abs() >= 0.005 {
+      continue;
+    }
+    let span_days = (b.ts - a.ts) as f32 / 86_400.;
+    if !(PAIR_MIN_DAYS..=PAIR_MAX_DAYS).contains(&span_days) {
+      continue;
+    }
+    let start_day = (a.date - first_date).num_days() as usize;
+    let end_day = (b.date - first_date).num_days() as usize;
+    if shock_prefix[end_day + 1] - shock_prefix[start_day] > 0 {
+      continue;
+    }
+    pairs.push(SamePpPair {
+      rank: a.rank,
+      start_day: start_day as u32,
+      end_day: end_day as u32,
+      rate: (b.rank as f32 - a.rank as f32) / span_days,
+    });
+  }
+  pairs
+}
+
+/// Pairs within this fraction of a bucket's rank contribute to its direct decay estimate.
+const DIRECT_RANK_WINDOW: f64 = 0.10;
+const DIRECT_MIN_PAIRS: usize = 5;
+/// Smoothed pair count at which the direct estimate fully replaces the surface-derived one.
+const DIRECT_FULL_WEIGHT_PAIRS: f32 = 15.;
+
+/// Per (day, bucket) median rate over same-pp pairs near the bucket's rank whose span covers the
+/// day.  Returns (values, counts); value is NaN where fewer than `DIRECT_MIN_PAIRS` pairs cover it.
+fn calculate_direct_decay(
+  pairs: &mut [SamePpPair],
+  buckets: &[u32],
+  num_days: usize,
+) -> (Vec<f32>, Vec<f32>) {
+  pairs.sort_unstable_by_key(|p| p.rank);
+  let num_buckets = buckets.len();
+  let mut values = vec![f32::NAN; num_days * num_buckets];
+  let mut counts = vec![0f32; num_days * num_buckets];
+  let mut entries: Vec<(u32, f32)> = Vec::new();
+
+  for (bucket_idx, &rank) in buckets.iter().enumerate() {
+    let lo = rank as f64 * (1. - DIRECT_RANK_WINDOW);
+    let hi = rank as f64 * (1. + DIRECT_RANK_WINDOW);
+    let lo_ix = pairs.partition_point(|p| (p.rank as f64) < lo);
+    let hi_ix = pairs.partition_point(|p| (p.rank as f64) <= hi);
+
+    entries.clear();
+    for p in &pairs[lo_ix..hi_ix] {
+      for day in p.start_day..=p.end_day {
+        entries.push((day, p.rate));
+      }
+    }
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+
+    let mut i = 0;
+    while i < entries.len() {
+      let day = entries[i].0;
+      let mut j = i;
+      while j < entries.len() && entries[j].0 == day {
+        j += 1;
+      }
+      let n = j - i;
+      if n >= DIRECT_MIN_PAIRS {
+        let ix = day as usize * num_buckets + bucket_idx;
+        values[ix] = entries[i + (n - 1) / 2].1;
+        counts[ix] = n as f32;
+      }
+      i = j;
+    }
+  }
+
+  (values, counts)
+}
+
+/// Same triangular smoothing as `smooth_matrix`, skipping NaN cells and carrying the pair counts
+/// along so the blend can weight by evidence.
+fn smooth_direct_decay(
+  values: &[f32],
+  counts: &[f32],
+  num_buckets: usize,
+  num_days: usize,
+  shock_intervals: &[(usize, usize)],
+  window_radius: usize,
+) -> (Vec<f32>, Vec<f32>) {
+  let mut smoothed_values = vec![f32::NAN; values.len()];
+  let mut smoothed_counts = vec![0f32; counts.len()];
+
+  for day in 0..num_days {
+    let Some((start, end)) = clamped_window(day, window_radius, num_days, shock_intervals) else {
+      continue;
+    };
+    let window_len = (end - start + 1) as f32;
+
+    for bucket_idx in 0..num_buckets {
+      let (mut weight_all, mut weight_valid, mut value_sum, mut count_sum) =
+        (0f32, 0f32, 0f32, 0f32);
+      for d in start..=end {
+        let weight = 1. - (d as f32 - day as f32).abs() / window_len;
+        let ix = d * num_buckets + bucket_idx;
+        weight_all += weight;
+        count_sum += weight * counts[ix];
+        if values[ix].is_finite() {
+          weight_valid += weight;
+          value_sum += weight * values[ix];
+        }
+      }
+      let ix = day * num_buckets + bucket_idx;
+      if weight_valid > 0. {
+        smoothed_values[ix] = value_sum / weight_valid;
+      }
+      smoothed_counts[ix] = count_sum / weight_all;
+    }
+  }
+
+  (smoothed_values, smoothed_counts)
+}
+
+fn blend_decay(surface: &[f32], direct: &[f32], direct_counts: &[f32]) -> Vec<f32> {
+  surface
+    .iter()
+    .zip(direct)
+    .zip(direct_counts)
+    .map(|((&s, &d), &count)| {
+      if !d.is_finite() {
+        return s;
+      }
+      if !s.is_finite() {
+        return d;
+      }
+      let w = (count / DIRECT_FULL_WEIGHT_PAIRS).min(1.);
+      w * d + (1. - w) * s
+    })
+    .collect()
 }
 
 fn get_rank_for_pp(pp_row: &[f32], buckets: &[u32], target_pp: f32) -> f32 {
@@ -977,48 +1115,50 @@ fn smooth_simulation_curve(
   smoothed_values
 }
 
+/// Number of most recent valid decay rows averaged into the simulation's decay curve.
+const SIM_DECAY_LOOKBACK_ROWS: usize = 14;
+const MIN_RELIABLE_PP: f32 = 30.;
+
 fn generate_simulation_profile(
   pp_matrix: &[f32],
+  decay_matrix: &[f32],
   buckets: &[u32],
   num_days: usize,
-  shocks: &[usize],
 ) -> SimulationProfile {
   let num_buckets = buckets.len();
-  let lookback = 30.min(num_days);
-  let start_day = num_days.saturating_sub(lookback);
+  let latest_pp_row = &pp_matrix[(num_days - 1) * num_buckets..];
 
+  let rank_to_pp: Vec<(u32, f32)> = buckets
+    .iter()
+    .copied()
+    .zip(latest_pp_row.iter().copied())
+    .collect();
+  let max_rank = buckets
+    .iter()
+    .zip(latest_pp_row)
+    .take_while(|(_, &pp)| pp >= MIN_RELIABLE_PP)
+    .map(|(&rank, _)| rank)
+    .last()
+    .unwrap_or(buckets[0]);
+
+  // The decay matrix already respects shock intervals, so its most recent valid rows are the
+  // cleanest view of the current rate.
   let mut rank_to_decay = Vec::with_capacity(num_buckets);
-  let mut rank_to_pp = Vec::with_capacity(num_buckets);
-  let shock_day_set: FxHashSet<usize> = shocks.iter().copied().collect();
-
   for bucket_idx in 0..num_buckets {
-    let rank = buckets[bucket_idx];
-
-    // Decay is a noisy value so we want to average that, but we want to use the rank to pp profile
-    // from the most recent day since that's much more stable.
-    let latest_pp = pp_matrix[(num_days - 1) * num_buckets + bucket_idx];
-    rank_to_pp.push((rank, latest_pp));
-
-    // Calculate decay by finding the slope of the rank trajectory for a fixed PP value.
-    let start_pp = pp_matrix[start_day * num_buckets + bucket_idx];
-    let mut points = Vec::new();
-    for day in start_day..num_days {
-      if shock_day_set.contains(&day) {
-        continue;
+    let mut sum = 0.;
+    let mut n = 0;
+    for day in (0..num_days).rev() {
+      let val = decay_matrix[day * num_buckets + bucket_idx];
+      if val.is_finite() {
+        sum += val;
+        n += 1;
+        if n == SIM_DECAY_LOOKBACK_ROWS {
+          break;
+        }
       }
-
-      let pp_row = &pp_matrix[day * num_buckets..(day + 1) * num_buckets];
-      let r_actual = get_rank_for_pp(pp_row, buckets, start_pp);
-      let day_index_for_regression = points.len() as f32;
-      points.push((day_index_for_regression, r_actual));
     }
-
-    let slope = if points.len() > 1 {
-      linear_slope(&points)
-    } else {
-      0.
-    };
-    rank_to_decay.push((rank, slope));
+    let decay = if n > 0 { sum / n as f32 } else { 0. };
+    rank_to_decay.push((buckets[bucket_idx], decay));
   }
 
   let mut rank_to_density = Vec::with_capacity(num_buckets);
@@ -1075,6 +1215,7 @@ fn generate_simulation_profile(
     rank_to_decay,
     rank_to_density,
     rank_to_pp,
+    max_rank,
   }
 }
 
@@ -1168,6 +1309,9 @@ fn get_history_for_rank(
   result
 }
 
+/// Encodes NaN decay cells (shock intervals) in the binary dataset; the client maps it back to NaN.
+const DECAY_NAN_SENTINEL: i32 = i32::MIN;
+
 impl AnalysisData {
   fn get_pp_history_for_rank(&self, rank: u32) -> Vec<(NaiveDate, f32)> {
     get_history_for_rank(rank, &self.pp_matrix, &self.dates, &self.buckets)
@@ -1183,7 +1327,7 @@ impl AnalysisData {
     let start_date_epoch: i64 = self
       .dates
       .first()
-      .map(|d| d.and_hms_opt(4, 20, 0).unwrap().and_utc().timestamp())
+      .map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp())
       .unwrap_or(0);
     let days_count = self.dates.len() as u32;
 
@@ -1237,7 +1381,11 @@ impl AnalysisData {
 
     let mut truncated_decay_matrix = Vec::with_capacity(self.decay_matrix.len());
     for &val in &self.decay_matrix {
-      let val = (val * 100.) as i32;
+      let val = if val.is_finite() {
+        (val * 100.) as i32
+      } else {
+        DECAY_NAN_SENTINEL
+      };
       truncated_decay_matrix.push(val);
     }
 

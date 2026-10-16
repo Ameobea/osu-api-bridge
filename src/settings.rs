@@ -50,6 +50,28 @@ fn default_diffcalc_settings() -> DiffcalcSettings {
 }
 
 #[settings]
+pub struct BackgroundUpdateSettings {
+  /// Seconds between refreshes of the least recently updated user; 0 disables the loop.
+  #[serde(default = "default_u64::<17>")]
+  pub oldest_user_interval_secs: u64,
+  /// Seconds between refreshes of a random user id; 0 disables the loop.
+  #[serde(default = "default_u64::<58>")]
+  pub random_user_interval_secs: u64,
+  /// The oldest-user loop skips users with no top play and no observed pp / playcount change
+  /// within this many days; 0 refreshes every user regardless.
+  #[serde(default = "default_u64::<1826>")]
+  pub oldest_user_max_idle_days: u64,
+}
+
+fn default_background_updates() -> BackgroundUpdateSettings {
+  BackgroundUpdateSettings {
+    oldest_user_interval_secs: 17,
+    random_user_interval_secs: 58,
+    oldest_user_max_idle_days: 1826,
+  }
+}
+
+#[settings]
 pub struct ServerSettings {
   /// Telemetry settings.
   pub telemetry: TelemetrySettings,
@@ -70,4 +92,7 @@ pub struct ServerSettings {
   pub diffcalc: DiffcalcSettings,
   #[cfg(feature = "daily_challenge")]
   pub daily_challenge: DailyChallengeSettings,
+  /// Background osu!track refresh loops.
+  #[serde(default = "default_background_updates")]
+  pub background_updates: BackgroundUpdateSettings,
 }

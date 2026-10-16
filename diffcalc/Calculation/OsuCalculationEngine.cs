@@ -45,9 +45,12 @@ public sealed class OsuCalculationEngine
     public async Task<CalculationResult> CalculateAsync(
         CalculationRequest request,
         string operation,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IReadOnlyDictionary<int, MemoryWorkingBeatmap>? preloaded = null)
     {
-        var working = await beatmaps.GetAsync(request.BeatmapId, operation, cancellationToken);
+        var working = preloaded is not null && preloaded.TryGetValue(request.BeatmapId, out var held)
+            ? held
+            : await beatmaps.GetAsync(request.BeatmapId, operation, cancellationToken);
         var ruleset = new OsuRuleset();
         var mods = ModParser.Parse(request, ruleset);
         var cacheKey = ModParser.BuildCacheKey(request.BeatmapId, mods);

@@ -1,18 +1,28 @@
 use std::{collections::HashSet, time::Duration};
 
 use axum::{extract::Query, Json};
+use chrono::NaiveDateTime;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use crate::{
   db::db_pool,
+  metrics::http_server,
   osu_api::{fetch_user_hiscores, fetch_user_info, fetch_username, Ruleset},
 };
 
-use super::{APIError, SETTINGS};
+use super::{osutrack_update::hiscore_columns, APIError, SETTINGS};
 
 pub(crate) fn validate_admin_api_token(admin_api_token: &str) -> Result<(), APIError> {
-  if admin_api_token != SETTINGS.get().unwrap().daily_challenge.admin_token {
+  let expected = &SETTINGS.get().unwrap().daily_challenge.admin_token;
+  if expected.is_empty() {
+    error!("Rejecting admin request: no admin token configured");
+    return Err(APIError {
+      status: StatusCode::UNAUTHORIZED,
+      message: "Admin API token not configured".to_owned(),
+    });
+  }
+  if admin_api_token != expected {
     if admin_api_token.is_empty() {
       return Err(APIError {
         status: StatusCode::BAD_REQUEST,
@@ -43,11 +53,11 @@ async fn archive_and_delete_user(user_id: i64) -> Result<(), APIError> {
     }
   })?;
 
-  sqlx::query(
-    "INSERT INTO hiscore_updates_deleted (user, beatmap_id, score, pp, mods, rank, score_time, \
-     update_time, mode, is_classic) SELECT user, beatmap_id, score, pp, mods, rank, score_time, \
-     update_time, mode, is_classic FROM hiscore_updates WHERE user = ?;",
-  )
+  let cols = hiscore_columns().await;
+  sqlx::query(sqlx::AssertSqlSafe(format!(
+    "INSERT INTO hiscore_updates_deleted ({cols}) SELECT {cols} FROM hiscore_updates WHERE user = \
+     ?;"
+  )))
   .bind(user_id)
   .execute(&mut *txn)
   .await
@@ -208,11 +218,11 @@ pub(super) async fn maybe_undelete_user(
     },
   };
 
-  sqlx::query(
-    "INSERT IGNORE INTO hiscore_updates (user, beatmap_id, score, pp, mods, rank, score_time, \
-     update_time, mode, is_classic) SELECT user, beatmap_id, score, pp, mods, rank, score_time, \
-     update_time, mode, is_classic FROM hiscore_updates_deleted WHERE user = ?;",
-  )
+  let cols = hiscore_columns().await;
+  sqlx::query(sqlx::AssertSqlSafe(format!(
+    "INSERT IGNORE INTO hiscore_updates ({cols}) SELECT {cols} FROM hiscore_updates_deleted WHERE \
+     user = ?;"
+  )))
   .bind(user_id)
   .execute(&mut *txn)
   .await
@@ -283,46 +293,85 @@ pub(crate) async fn update_all_modes_for_user(user_id: u64) -> Result<(), APIErr
   Ok(())
 }
 
+/// Newest evidence osu!track has that a user still plays: their latest top play, or the latest
+/// update whose pp / playcount differed from the previous one in the same mode. `None` for users
+/// with no rows at all (accounts with no rank and no top plays).
+async fn last_activity(user_id: i64) -> sqlx::Result<Option<NaiveDateTime>> {
+  let pool = db_pool();
+  let last_play: Option<NaiveDateTime> =
+    sqlx::query_scalar("SELECT MAX(score_time) FROM hiscore_updates WHERE user = ?")
+      .bind(user_id)
+      .fetch_one(pool)
+      .await?;
+  let rows: Vec<(i64, f64, i64, NaiveDateTime)> = sqlx::query_as(
+    "SELECT CAST(mode AS SIGNED), CAST(pp_raw AS DOUBLE), CAST(playcount AS SIGNED), \
+     CAST(timestamp AS DATETIME) FROM updates WHERE user = ? ORDER BY mode, timestamp",
+  )
+  .bind(user_id)
+  .fetch_all(pool)
+  .await?;
+  let last_change = rows
+    .windows(2)
+    .filter(|w| w[0].0 == w[1].0 && (w[0].1 != w[1].1 || w[0].2 != w[1].2))
+    .map(|w| w[1].3)
+    .max();
+  Ok(last_play.max(last_change))
+}
+
+const MAX_SKIPS_PER_TICK: usize = 200;
+
 pub(crate) async fn update_oldest_user_inner() -> Result<(), APIError> {
   let pool = db_pool();
-  let oldest_user: Option<i64> = sqlx::query_scalar(
-    "SELECT osu_id FROM users WHERE osu_id > 2000000 ORDER BY last_updated ASC LIMIT 1;",
-  )
-  .fetch_optional(pool)
-  .await
-  .map_err(|err| {
-    error!("Error fetching oldest user: {err}");
-    APIError {
-      status: StatusCode::INTERNAL_SERVER_ERROR,
-      message: "Error fetching oldest user".to_owned(),
-    }
-  })?;
-
-  let user_id = match oldest_user {
-    Some(id) => id,
-    None => {
-      return Err(APIError {
-        status: StatusCode::BAD_REQUEST,
-        message: "No users found in database".to_owned(),
-      });
-    },
-  };
-
-  let query = "UPDATE users SET last_updated = CURRENT_TIMESTAMP WHERE osu_id = ?;";
-  sqlx::query(query)
-    .bind(user_id)
-    .execute(pool)
-    .await
-    .map_err(|err| {
-      error!("Error updating last_updated for user ID {user_id}: {err}");
+  let max_idle_days = SETTINGS
+    .get()
+    .unwrap()
+    .background_updates
+    .oldest_user_max_idle_days;
+  let db_err = |what: &'static str| {
+    move |err: sqlx::Error| {
+      error!("{what}: {err}");
       APIError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: "Error updating last_updated for user".to_owned(),
+        message: what.to_owned(),
       }
+    }
+  };
+
+  for _ in 0..MAX_SKIPS_PER_TICK {
+    let user_id: i64 = sqlx::query_scalar(
+      "SELECT osu_id FROM users WHERE osu_id > 2000000 ORDER BY last_updated ASC LIMIT 1;",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err("Error fetching oldest user"))?
+    .ok_or_else(|| APIError {
+      status: StatusCode::BAD_REQUEST,
+      message: "No users found in database".to_owned(),
     })?;
 
-  update_all_modes_for_user(user_id as u64).await?;
+    // Bumped before the liveness check so skipped users also move to the back of the queue.
+    sqlx::query("UPDATE users SET last_updated = CURRENT_TIMESTAMP WHERE osu_id = ?;")
+      .bind(user_id)
+      .execute(pool)
+      .await
+      .map_err(db_err("Error updating last_updated for user"))?;
 
+    if max_idle_days > 0 {
+      let last = last_activity(user_id)
+        .await
+        .map_err(db_err("Error checking user activity"))?;
+      let cutoff = chrono::Utc::now().naive_utc() - chrono::Duration::days(max_idle_days as i64);
+      if last.is_none_or(|t| t < cutoff) {
+        http_server::oldest_user_skipped_total().inc();
+        debug!("Skipping oldest user id={user_id}; last activity {last:?}");
+        continue;
+      }
+    }
+
+    update_all_modes_for_user(user_id as u64).await?;
+    return Ok(());
+  }
+  warn!("Skipped {MAX_SKIPS_PER_TICK} idle users in one tick without finding one to update");
   Ok(())
 }
 

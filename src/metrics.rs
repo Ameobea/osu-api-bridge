@@ -32,6 +32,9 @@ pub mod http_server {
   }]
   pub fn osu_api_response_time_seconds(endpoint_name: &'static str) -> TimeHistogram;
 
+  /// Users the oldest-user refresh loop skipped as idle
+  pub fn oldest_user_skipped_total() -> Counter;
+
   /// Number of requests made to refresh the OAuth token
   pub fn oauth_refresh_requests_total() -> Counter;
 

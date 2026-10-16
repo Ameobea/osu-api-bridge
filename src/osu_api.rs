@@ -188,6 +188,14 @@ pub struct Statistics {
   pub small_tick_hit: Option<i64>,
   pub small_tick_miss: Option<i64>,
   pub slider_tail_hit: Option<i64>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub ignore_hit: Option<i64>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub ignore_miss: Option<i64>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub combo_break: Option<i64>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub legacy_combo_increase: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -764,6 +772,62 @@ pub async fn fetch_users_batch(user_ids: &[u64]) -> Result<Vec<User>, APIError> 
   }
 }
 
+/// One entry of the batch users endpoint: the parsed fields the osutrack update path needs plus
+/// the untouched JSON object so callers can persist everything the API returned.
+pub struct V2BatchUser {
+  pub id: u64,
+  pub username: String,
+  pub statistics_rulesets: std::collections::HashMap<String, V2UserStatistics>,
+  pub raw: Value,
+}
+
+/// `GET /users?ids[]=…` (≤ `MAX_BATCH_USERS`): every user's `statistics_rulesets` for all four
+/// modes in one request. Users that don't exist are simply absent from the result.
+pub async fn fetch_users_batch_stats(user_ids: &[u64]) -> Result<Vec<V2BatchUser>, APIError> {
+  #[derive(Deserialize)]
+  struct Parsed {
+    id: u64,
+    username: String,
+    #[serde(default)]
+    statistics_rulesets: std::collections::HashMap<String, V2UserStatistics>,
+  }
+
+  let endpoint_name = "fetch_users_batch_stats";
+  let ids = user_ids
+    .iter()
+    .map(|id| format!("ids[]={id}"))
+    .collect::<Vec<_>>()
+    .join("&");
+  let proxy_url = format!("https://osu.ppy.sh/api/v2/users?{ids}");
+  let res_text = make_osu_api_request(&proxy_url, endpoint_name, Method::GET).await?;
+
+  let parse_err = |err: String| {
+    error!("Failed to parse batch users stats response; res: {res_text}; err: {err}");
+    http_server::osu_api_requests_failed_total(endpoint_name, 200).inc();
+    APIError {
+      status: StatusCode::INTERNAL_SERVER_ERROR,
+      message: "Failed to parse batch users stats response".to_owned(),
+    }
+  };
+  let mut res: Value = serde_json::from_str(&res_text).map_err(|err| parse_err(err.to_string()))?;
+  let Some(Value::Array(users)) = res.get_mut("users").map(Value::take) else {
+    return Err(parse_err("missing `users` array".to_owned()));
+  };
+  users
+    .into_iter()
+    .map(|raw| {
+      let parsed: Parsed =
+        serde_json::from_value(raw.clone()).map_err(|err| parse_err(err.to_string()))?;
+      Ok(V2BatchUser {
+        id: parsed.id,
+        username: parsed.username,
+        statistics_rulesets: parsed.statistics_rulesets,
+        raw,
+      })
+    })
+    .collect()
+}
+
 #[test]
 fn fetch_users_batch_res_parse() {
   let res_text = r#"{"users":[{"id":4093752,"username":"ameo","avatar_url":"x","country_code":"US"},{"id":2,"username":"peppy"}]}"#;
@@ -1102,4 +1166,21 @@ pub mod daily_challenge {
 
     Ok(all_scores)
   }
+}
+
+#[test]
+fn fetch_users_batch_stats_parse() {
+  let raw: Value = serde_json::from_str(
+    r#"{"id":2707015,"username":"Fathnea","country_code":"AU","statistics_rulesets":{"osu":{"count_100":676714,"count_300":1502000,"count_50":130405,"level":{"current":95,"progress":78},"global_rank":739433,"pp":1297.05,"ranked_score":487715916,"hit_accuracy":80.3904,"play_count":9007,"total_score":7565524657,"grade_counts":{"ss":0,"ssh":0,"s":5,"sh":0,"a":63}},"taiko":{"count_100":942,"count_300":2379,"count_50":0,"level":{"current":6,"progress":68},"global_rank":null,"pp":0,"ranked_score":886331,"hit_accuracy":78.8636,"play_count":22,"total_score":1784609,"grade_counts":{"ss":0,"ssh":0,"s":0,"sh":0,"a":0}}}}"#,
+  )
+  .unwrap();
+  #[derive(Deserialize)]
+  struct Parsed {
+    statistics_rulesets: std::collections::HashMap<String, V2UserStatistics>,
+  }
+  let parsed: Parsed = serde_json::from_value(raw).unwrap();
+  let osu = &parsed.statistics_rulesets["osu"];
+  assert_eq!(osu.global_rank, Some(739433));
+  assert_eq!(osu.grade_counts.a, 63);
+  assert_eq!(parsed.statistics_rulesets["taiko"].global_rank, None);
 }

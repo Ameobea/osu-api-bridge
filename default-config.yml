@@ -43,3 +43,12 @@ diffcalc:
   request_timeout_ms: 20000
 daily_challenge:
   admin_token: ""
+# Background osu!track refresh loops.
+background_updates:
+  # Seconds between refreshes of the least recently updated user; 0 disables the loop.
+  oldest_user_interval_secs: 17
+  # Seconds between refreshes of a random user id; 0 disables the loop.
+  random_user_interval_secs: 58
+  # The oldest-user loop skips users with no top play and no observed pp / playcount change
+  # within this many days; 0 refreshes every user regardless.
+  oldest_user_max_idle_days: 1826

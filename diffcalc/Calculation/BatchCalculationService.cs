@@ -7,6 +7,7 @@ namespace DiffCalc.Calculation;
 
 public sealed class BatchCalculationService(
     OsuCalculationEngine engine,
+    CachedBeatmapProvider beatmaps,
     IOptions<DiffCalcOptions> options,
     ILogger<BatchCalculationService> logger)
 {
@@ -18,6 +19,7 @@ public sealed class BatchCalculationService(
         CancellationToken cancellationToken)
     {
         var results = new CalculationResult[calculations.Count];
+        var preloaded = await beatmaps.PrefetchAsync(calculations.Select(calculation => calculation.BeatmapId), operation, cancellationToken);
         await Parallel.ForEachAsync(
             Enumerable.Range(0, calculations.Count),
             new ParallelOptions
@@ -32,7 +34,7 @@ public sealed class BatchCalculationService(
                 timeout.CancelAfter(TimeSpan.FromSeconds(options.CalculationTimeoutSeconds));
                 try
                 {
-                    results[index] = await engine.CalculateAsync(request, operation, timeout.Token);
+                    results[index] = await engine.CalculateAsync(request, operation, timeout.Token, preloaded);
                 }
                 catch (BeatmapNotFoundException exception)
                 {

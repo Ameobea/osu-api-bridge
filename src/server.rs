@@ -486,6 +486,15 @@ async fn get_user_id(
     .map(Json)
 }
 
+lazy_static::lazy_static! {
+  /// Users osu!track doesn't know (mostly crawled daily-challenge pages) cost an osu! API request
+  /// per lookup otherwise; not-found is cached too.
+  static ref API_USERNAME_CACHE: moka::sync::Cache<u64, Option<String>> = moka::sync::Cache::builder()
+    .max_capacity(300_000)
+    .time_to_live(Duration::from_secs(7 * 86400))
+    .build();
+}
+
 async fn get_username(Path(user_id): Path<u64>) -> Result<Json<String>, APIError> {
   // first check local DB to avoid osu! API roundtrip
   #[cfg(feature = "sql")]
@@ -502,7 +511,14 @@ async fn get_username(Path(user_id): Path<u64>) -> Result<Json<String>, APIError
     }
   }
 
-  let username_opt = crate::osu_api::fetch_username(user_id).await?;
+  let username_opt = match API_USERNAME_CACHE.get(&user_id) {
+    Some(cached) => cached,
+    None => {
+      let fetched = crate::osu_api::fetch_username(user_id).await?;
+      API_USERNAME_CACHE.insert(user_id, fetched.clone());
+      fetched
+    },
+  };
   match username_opt {
     Some(username) => Ok(Json(username)),
     None => Err(APIError {
@@ -510,6 +526,43 @@ async fn get_username(Path(user_id): Path<u64>) -> Result<Json<String>, APIError
       message: format!("User with id {} not found", user_id),
     }),
   }
+}
+
+/// Endpoint names external callers (the play sampler and the per-user collector) may report osu!
+/// API usage under, so the `osu_api_requests_total` metric reflects everything spending this
+/// application's quota.
+const REPORTABLE_ENDPOINTS: [&str; 11] = [
+  "sampler_score",
+  "sampler_users_batch",
+  "sampler_user_extended",
+  "sampler_beatmap",
+  "sampler_replay",
+  "sampler_head_probe",
+  "sampler_token",
+  "collector_users_batch",
+  "collector_recent",
+  "collector_most_played",
+  "collector_token",
+];
+
+#[derive(Deserialize)]
+struct ReportApiUsageRequest {
+  admin_token: String,
+  counts: FxHashMap<String, u64>,
+}
+
+async fn report_api_usage(Json(req): Json<ReportApiUsageRequest>) -> Result<(), APIError> {
+  admin::validate_admin_api_token(&req.admin_token)?;
+  for (name, count) in &req.counts {
+    let Some(name) = REPORTABLE_ENDPOINTS.iter().find(|n| *n == name) else {
+      return Err(APIError {
+        status: StatusCode::BAD_REQUEST,
+        message: format!("Unknown endpoint name {name}"),
+      });
+    };
+    http_server::osu_api_requests_total(name).inc_by(*count);
+  }
+  Ok(())
 }
 
 #[derive(Clone)]
@@ -603,20 +656,31 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
     let _ = analysis::update_analysis_data().await;
   });
 
-  tokio::spawn(async {
-    loop {
-      let _ = admin::update_oldest_user_inner().await;
-      tokio::time::sleep(Duration::from_secs(17)).await;
-    }
-  });
+  let bg = &settings.background_updates;
+  if bg.oldest_user_interval_secs > 0 {
+    let interval = Duration::from_secs(bg.oldest_user_interval_secs);
+    tokio::spawn(async move {
+      loop {
+        let _ = admin::update_oldest_user_inner().await;
+        tokio::time::sleep(interval).await;
+      }
+    });
+  } else {
+    info!("Oldest-user refresh loop disabled by config");
+  }
 
-  tokio::spawn(async {
-    loop {
-      let user_id: u64 = rand::random_range(3..40_000_000);
-      let _ = admin::update_all_modes_for_user(user_id).await;
-      tokio::time::sleep(Duration::from_secs(58)).await;
-    }
-  });
+  if bg.random_user_interval_secs > 0 {
+    let interval = Duration::from_secs(bg.random_user_interval_secs);
+    tokio::spawn(async move {
+      loop {
+        let user_id: u64 = rand::random_range(3..40_000_000);
+        let _ = admin::update_all_modes_for_user(user_id).await;
+        tokio::time::sleep(interval).await;
+      }
+    });
+  } else {
+    info!("Random-user refresh loop disabled by config");
+  }
 
   let mut router = Router::new()
     .route("/", axum::routing::get(instrument_handler("index", index)))
@@ -886,6 +950,17 @@ pub async fn start_server(settings: &ServerSettings) -> BootstrapResult<()> {
           "osutrack_update",
           osutrack_update::osutrack_update,
         )),
+      )
+      .route(
+        "/users/bulk-update",
+        axum::routing::post(instrument_handler(
+          "bulk_update",
+          osutrack_update::bulk_update,
+        )),
+      )
+      .route(
+        "/osu-api-usage",
+        axum::routing::post(instrument_handler("report_api_usage", report_api_usage)),
       );
   }
 
