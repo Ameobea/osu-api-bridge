@@ -531,7 +531,7 @@ async fn get_username(Path(user_id): Path<u64>) -> Result<Json<String>, APIError
 /// Endpoint names external callers (the play sampler and the per-user collector) may report osu!
 /// API usage under, so the `osu_api_requests_total` metric reflects everything spending this
 /// application's quota.
-const REPORTABLE_ENDPOINTS: [&str; 11] = [
+const REPORTABLE_ENDPOINTS: [&str; 13] = [
   "sampler_score",
   "sampler_users_batch",
   "sampler_user_extended",
@@ -542,6 +542,8 @@ const REPORTABLE_ENDPOINTS: [&str; 11] = [
   "collector_users_batch",
   "collector_recent",
   "collector_most_played",
+  "collector_beatmaps_passed",
+  "collector_user_map_scores",
   "collector_token",
 ];
 

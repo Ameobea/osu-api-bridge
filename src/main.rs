@@ -23,6 +23,8 @@ mod oauth;
 mod osu_api;
 mod server;
 mod settings;
+#[cfg(feature = "sql")]
+mod user_map_scores;
 mod util;
 
 async fn start() -> BootstrapResult<()> {

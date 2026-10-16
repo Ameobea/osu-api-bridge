@@ -2370,6 +2370,7 @@ dependencies = [
  "base64",
  "chrono",
  "dashmap",
+ "flate2",
  "float-ord",
  "foundations",
  "fxhash",

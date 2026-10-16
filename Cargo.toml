@@ -24,6 +24,7 @@ float-ord = "0.3"
 sqlx = { version = "0.9", features = ["runtime-tokio", "macros", "mysql", "chrono", "json"], default-features = false, optional = true }
 arc-swap = "1.7.1"
 fxhash = "0.2.1"
+flate2 = "1"
 pin-project = "1.1.5"
 dashmap = "6.1.0"
 moka = { version = "0.12.11", features = ["sync"] }

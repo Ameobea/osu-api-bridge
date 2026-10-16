@@ -659,7 +659,7 @@ pub async fn fetch_osutrack_user_stats(
 
 #[derive(Deserialize)]
 struct FetchAllUserScoresForBeatmapRes {
-  scores: Vec<UserScoreOnBeatmap>,
+  scores: Vec<Value>,
 }
 
 pub async fn fetch_all_user_scores_for_beatmap(
@@ -672,8 +672,27 @@ pub async fn fetch_all_user_scores_for_beatmap(
   let res_text = make_osu_api_request(&proxy_url, endpoint_name, Method::GET).await?;
 
   let deserializer = &mut serde_json::Deserializer::from_str(&res_text);
-  match serde_path_to_error::deserialize::<_, FetchAllUserScoresForBeatmapRes>(deserializer) {
-    Ok(res) => Ok(res.scores),
+  let parsed = serde_path_to_error::deserialize::<_, FetchAllUserScoresForBeatmapRes>(deserializer)
+    .map_err(|err| err.to_string())
+    .and_then(|res| {
+      let typed = res
+        .scores
+        .iter()
+        .map(|s| serde_json::from_value(s.clone()))
+        .collect::<Result<Vec<UserScoreOnBeatmap>, _>>()
+        .map_err(|err| err.to_string())?;
+      Ok((typed, res.scores))
+    });
+  match parsed {
+    Ok((typed, raw)) => {
+      #[cfg(feature = "sql")]
+      if mode == Ruleset::Osu {
+        crate::user_map_scores::store(user_id, beatmap_id, raw);
+      }
+      #[cfg(not(feature = "sql"))]
+      let _ = raw;
+      Ok(typed)
+    },
     Err(err) => {
       error!("Failed to parse user score response; res: {res_text}; err: {err}");
       http_server::osu_api_requests_failed_total(endpoint_name, 200).inc();
